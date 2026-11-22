@@ -1,6 +1,6 @@
 {
   "name": "dsh-half-page",
-  "version": "0.3.28",
+  "version": "0.3.36",
   "private": false,
   "author": "鹿野 <luye@dsh.local>",
   "license": "MIT",
@@ -19,6 +19,7 @@
     "locale/*.json",
     "icon.svg",
     "assets/*",
+    "books/*.txt",
     "screenshots.json"
   ],
   "dsh": {

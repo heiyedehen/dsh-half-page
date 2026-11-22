@@ -1,9 +1,10 @@
 // dsh-half-page · 半页（自己的读书与写字）
 // 宿主侧：书库、切章、读后感、进度；客户端面板读 HTTP 路由。
-import { readFile, writeFile, mkdir, readdir, stat, rename } from 'node:fs/promises'
+import { readFile, writeFile, mkdir, readdir, stat, rename, open } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { join, basename, dirname, extname, resolve } from 'node:path'
 import { homedir } from 'node:os'
+import { fileURLToPath } from 'node:url'
 
 export const inject = ['webServer', 'tools', 'systemPrompt']
 
@@ -41,7 +42,18 @@ export async function config() {
 }
 
 export async function ensureDir(dir) {
-  await mkdir(join(dir, 'books'), { recursive: true })
+  const books = join(dir, 'books')
+  await mkdir(books, { recursive: true })
+  // 第一次装：书架是空的，就放一本自带的书进去（《古文观止》，公版，121 篇选）。
+  // 只在空书架时放一次，删掉之后不会再回来。
+  try {
+    const have = (await readdir(books)).filter((f) => /\.(txt|md)$/i.test(f))
+    if (!have.length) {
+      const src = join(dirname(fileURLToPath(import.meta.url)), 'books', '古文观止.txt')
+      const buf = await readFile(src)
+      await writeFile(join(books, '古文观止.txt'), buf)
+    }
+  } catch {}
   return dir
 }
 
@@ -92,6 +104,159 @@ export function chapterText(text, chapters, n) {
   return text.slice(c.start, c.end).trim()
 }
 
+/* ------------------------------------------------------------------ 章表
+ * 读一章不再整本 decode：第一次打开某本书时扫一遍，把每章的字符偏移换算成
+ * 字节偏移，落盘成 books/<id>.toc.json；以后按 byteStart..byteEnd 只读这一段。
+ */
+
+const TOC_VERSION = 1
+
+export function tocPath(dir, id) {
+  return join(dir, 'books', id + '.toc.json')
+}
+
+async function bookFile(dir, id) {
+  for (const ext of ['.txt', '.md']) {
+    const p = join(dir, 'books', id + ext)
+    try {
+      const st = await stat(p)
+      return { path: p, size: st.size, mtimeMs: st.mtimeMs }
+    } catch {}
+  }
+  throw new Error(`没有这本书：${id}`)
+}
+
+function utf8Width(cp) {
+  return cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4
+}
+
+/** GB18030 的字节宽度：ASCII 1；0x81–0xFE + 0x30–0x39 是四字节；其余两字节 */
+function gbWidth(buf, i) {
+  const b = buf[i]
+  if (b < 0x80) return 1
+  if (b >= 0x81 && b <= 0xfe && i + 1 < buf.length && buf[i + 1] >= 0x30 && buf[i + 1] <= 0x39) return 4
+  return 2
+}
+
+/** 认编码（顺带认出 BOM 长度） */
+export function sniffEncoding(buf) {
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(buf)
+    const bom = buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf ? 3 : 0
+    return { encoding: 'utf-8', bom }
+  } catch {
+    return { encoding: 'gb18030', bom: 0 }
+  }
+}
+
+/**
+ * 扫一遍整本，产出章表。字符偏移 → 字节偏移走一遍累加，不建大数组。
+ * 返回 null 表示宽度累加对不上（文件坏了或怪编码），调用方退回整本方案。
+ */
+export function buildToc(buffer, id) {
+  const { encoding, bom } = sniffEncoding(buffer)
+  const body = bom ? buffer.subarray(bom) : buffer
+  const text = stripBom(new TextDecoder(encoding).decode(body))
+  const chapters = splitChapters(text)
+  const starts = chapters.map((c) => c.start)
+  let ci = 0
+  let bi = bom
+  let k = 0
+  for (const ch of text) {
+    while (k < chapters.length && starts[k] === ci) {
+      chapters[k].byteStart = bi
+      k += 1
+    }
+    const cp = ch.codePointAt(0)
+    bi += encoding === 'utf-8' ? utf8Width(cp) : gbWidth(body, bi)
+    ci += ch.length
+  }
+  while (k < chapters.length) {
+    chapters[k].byteStart = bi
+    k += 1
+  }
+  for (let i = 0; i < chapters.length; i += 1) {
+    chapters[i].byteEnd = i + 1 < chapters.length ? chapters[i + 1].byteStart : buffer.length
+  }
+  if (bi !== buffer.length) return null
+  return {
+    version: TOC_VERSION,
+    id,
+    encoding,
+    bom,
+    bytes: buffer.length,
+    chars: text.length,
+    chapters,
+  }
+}
+
+/** 取章表：有且没过期就用，否则整本扫一次并重写 */
+export async function tocFor(dir, id, opts = {}) {
+  const file = await bookFile(dir, id)
+  const tp = tocPath(dir, id)
+  if (!opts.force) {
+    try {
+      const saved = JSON.parse(stripBom(await readFile(tp, 'utf8')))
+      const fresh = saved
+        && saved.version === TOC_VERSION
+        && saved.bytes === file.size
+        && Number(saved.mtimeMs) === Math.round(file.mtimeMs)
+        && Array.isArray(saved.chapters)
+        && saved.chapters.length > 0
+        && saved.chapters.every((c) => Number.isInteger(c.byteStart) && Number.isInteger(c.byteEnd))
+      if (fresh) return { ...saved, file: file.path, tocPath: tp }
+    } catch {}
+  }
+  const buffer = await readFile(file.path)
+  const built = buildToc(buffer, id)
+  if (!built) return null
+  const rec = { ...built, file: basename(file.path), mtimeMs: Math.round(file.mtimeMs) }
+  await writeJson(tp, rec)
+  return { ...rec, file: file.path, tocPath: tp }
+}
+
+/** 只按偏移读那一章，不碰整本 */
+export async function readChapterByOffset(dir, id, n) {
+  const toc = await tocFor(dir, id)
+  if (!toc) return null
+  const c = toc.chapters[n - 1]
+  if (!c) return { text: '', chapter: null, toc }
+  const len = c.byteEnd - c.byteStart
+  const buf = Buffer.alloc(len)
+  let off = 0
+  const fh = await open(toc.file, 'r')
+  try {
+    while (off < len) {
+      const { bytesRead } = await fh.read(buf, off, len - off, c.byteStart + off)
+      if (!bytesRead) break
+      off += bytesRead
+    }
+  } finally {
+    await fh.close()
+  }
+  const text = stripBom(new TextDecoder(toc.encoding).decode(buf.subarray(0, off)))
+  return { text: text.trim(), chapter: c, toc, tocPath: toc.tocPath }
+}
+
+/** 一章正文：先走章表，实在没有才退回整本切 */
+export async function chapterBody(dir, id, info, n) {
+  try {
+    const got = await readChapterByOffset(dir, id, n)
+    if (got) return got.text
+  } catch {}
+  if (typeof info?.text === 'string') return chapterText(info.text, info.chapters, n)
+  const file = await bookFile(dir, id)
+  const text = await readTextSmart(await readFile(file.path))
+  return chapterText(text, splitChapters(text), n)
+}
+
+/** 搜东西这种确实要整本的，才整本读 */
+export async function fullTextOf(dir, id) {
+  const file = await bookFile(dir, id)
+  const text = await readTextSmart(await readFile(file.path))
+  return { text, chapters: splitChapters(text) }
+}
+
 /** 书库：books/*.txt */
 export async function listBooks(dir) {
   const out = []
@@ -107,18 +272,13 @@ export async function listBooks(dir) {
   return out
 }
 
-/** 打开某本书并缓存它有多少章 */
+/** 打开某本书：优先用章表（不整本 decode），没有章表才扫一遍并落盘 */
 export async function bookInfo(dir, id) {
-  const p = join(dir, 'books', id + '.txt')
-  let text
-  try {
-    text = await readTextSmart(await readFile(p))
-  } catch {
-    const p2 = join(dir, 'books', id + '.md')
-    text = await readTextSmart(await readFile(p2))
-  }
-  const chapters = splitChapters(text)
-  return { text, chapters }
+  const toc = await tocFor(dir, id)
+  if (toc) return { chapters: toc.chapters, toc, tocPath: toc.tocPath, text: null }
+  const file = await bookFile(dir, id)
+  const text = await readTextSmart(await readFile(file.path))
+  return { text, chapters: splitChapters(text), toc: null, tocPath: '' }
 }
 
 export async function importBook(dir, srcPath) {
@@ -205,11 +365,28 @@ export async function appendNote(dir, bookTitle, chapterTitle, lines, by) {
   const p = await notesPath(dir)
   let raw = ''
   try { raw = await readFile(p, 'utf8') } catch {}
-  if (!new RegExp(`^##\\s+${bookTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'm').test(raw)) {
-    raw += (raw.trim() ? '\n\n' : '') + `## ${bookTitle}\n`
+  const esc = bookTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  let block = `\n### ${chapterTitle}\n` + lines.map((l) => `- ${l}`).join('\n') + '\n'
+  if (by) {
+    const d = new Date()
+    const pad = (n) => String(n).padStart(2, '0')
+    const ts = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+    block += `- \u21b3 \u6765\u81ea\uff1a${by} \u00b7 ${ts}\n`
   }
-  raw += `\n### ${chapterTitle}\n` + lines.map((l) => `- ${l}`).join('\n') + '\n'
-  if (by) raw += `- ↳ 来自：${by}\n`
+  const headRe = new RegExp(`^##\\s+${esc}\\s*$`, 'm')
+  const m = headRe.exec(raw)
+  if (!m) {
+    raw = (raw.trim() ? raw.replace(/\s*$/, '') + '\n\n' : '') + `## ${bookTitle}\n` + block
+  } else {
+    const at0 = m.index + m[0].length
+    const next = raw.slice(at0).search(/^##\s+/m)
+    if (next < 0) {
+      raw = raw.replace(/\s*$/, '') + '\n' + block
+    } else {
+      const at = at0 + next
+      raw = raw.slice(0, at).replace(/\s*$/, '') + '\n' + block + '\n' + raw.slice(at)
+    }
+  }
   await writeFile(p, raw, 'utf8')
   return p
 }
@@ -251,7 +428,7 @@ export function apply(ctx) {
         let notes = ''
         try { notes = await readFile(await notesPath(dir), 'utf8') } catch {}
         res.setHeader('content-type', 'application/json; charset=utf-8')
-        res.end(JSON.stringify({ ok: true, dir, perDay, today: today(), readToday: rt, current: st.current, books, notes }))
+        res.end(JSON.stringify({ ok: true, dir, perDay, today: today(), readToday: rt, current: st.current, books, notes, noteSort: Number(cfgNow.noteSort) || 0 }))
       },
     }),
   )
@@ -289,7 +466,7 @@ export function apply(ctx) {
           const ch = n > 0 ? Math.min(Math.max(1, n), info.chapters.length) : (rec.readThrough || 1)
           res.end(JSON.stringify({
             ok: true, book: id, chapter: ch, total: info.chapters.length,
-            title: info.chapters[ch - 1]?.title || '', text: chapterText(info.text, info.chapters, ch),
+            title: info.chapters[ch - 1]?.title || '', text: await chapterBody(dir, id, info, ch),
           }))
         } catch (e) {
           res.end(JSON.stringify({ ok: false, error: String(e && e.message || e) }))
@@ -353,7 +530,7 @@ export function apply(ctx) {
     }),
   )
 
-  // 作品库：D:\dsh work\self\作品（可被 reading.config.json 的 worksDir 覆盖）
+  // 作品库：默认 ~/.dsh/reading/作品（可被 reading.config.json 的 worksDir 覆盖）
 // 谁写的：作品 md 开头可以带 frontmatter（---\nby: 名字\n---），也认一行「by: 名字」。
 // 一台机器上可能有好几个智能体，光靠文件夹分不出人。
 async function authorOf(abs) {
@@ -725,6 +902,25 @@ async function signWork(rel, who) {
     }),
   )
 
+  // 读后感的排序方式（0=章节升 1=章节降 2=时间降），存在 reading.config.json 里
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/dsh-reading.notesort',
+      async handler(req, res) {
+        let body = ''
+        for await (const chunk of req) body += chunk
+        let patch = {}
+        try { patch = JSON.parse(body || '{}') } catch {}
+        const sort = Math.max(0, Math.min(2, Number(patch.sort) || 0))
+        const cfg = { ...(await config()) }
+        await writeJson(CONFIG, { ...cfg, noteSort: sort })
+        res.setHeader('content-type', 'application/json; charset=utf-8')
+        res.end(JSON.stringify({ ok: true, noteSort: sort }))
+      },
+    }),
+  )
+
   // 书籍状态：在读 / 已读完 / 弃坑（空 status 表示清掉）
   ctx.effect(() =>
     ctx.webServer.register({
@@ -843,7 +1039,7 @@ async function signWork(rel, who) {
         rec.chapters = info.chapters.length
         const n = Number(args?.chapter) > 0 ? Math.floor(Number(args.chapter)) : rec.next || 1
         if (n < 1 || n > info.chapters.length) throw new Error(`章号超出范围：1–${info.chapters.length}`)
-        const body = chapterText(info.text, info.chapters, n)
+        const body = await chapterBody(dir, id, info, n)
         rec.readThrough = Math.max(rec.readThrough || 0, n)
         rec.next = Math.min(info.chapters.length, n + 1)
         rec.lastReadAt = new Date().toISOString()
@@ -858,6 +1054,7 @@ async function signWork(rel, who) {
           chapter: n,
           title: info.chapters[n - 1].title,
           chapters: info.chapters.length,
+          tocPath: info.tocPath || '',
           chars: body.length,
           next: rec.next,
           perDay,
@@ -949,7 +1146,7 @@ async function signWork(rel, who) {
         const { dir, st } = await stateOf()
         const id = args?.book || st.current
         if (!id) throw new Error('还没有正在读的书')
-        const { text, chapters } = await bookInfo(dir, id)
+        const { text, chapters } = await fullTextOf(dir, id)
         const hits = []
         let at = text.indexOf(q)
         while (at >= 0 && hits.length < limit) {

@@ -40,6 +40,7 @@ dsh plugin add dsh-half-page
 ~/.dsh/reading/
 ├── books/          书（.txt / .md）
 │   └── .trash/     下架的书挪到这儿，可手工找回
+├── books/<id>.toc.json  章表：每章的字符偏移 + 字节偏移
 ├── 读后感.md        所有读后感，按 ## 书名 / ### 章名 分块
 ├── 作品/            它自己写的东西
 └── state.json      读到哪了
@@ -56,6 +57,21 @@ dsh plugin add dsh-half-page
 | `reading_note` | 给这章写一两句读后感，可带 `by` |
 | `reading_search` | 在书里搜词，返回第几章、哪一行 |
 | `reading_recap` | 已读部分压成一页 |
+
+## 章表（读一章不整本 decode）
+
+第一次打开某本书时扫一遍，把每章的位置换算成字节偏移，落成 `books/<id>.toc.json`：
+
+```json
+{ "version": 1, "encoding": "gb18030", "bytes": 9638898, "chars": 3123456,
+  "chapters": [{ "title": "第一章 小二上酒", "charStart": 0, "charEnd": 3201, "byteStart": 0, "byteEnd": 6430 }] }
+```
+
+以后 `reading_next` 只 `fs.open` + 读 `byteStart..byteEnd` 那一段，再单独解这一段的编码——14MB 的书读一章不再把整本读进内存。
+
+- 章表过期（文件 mtime 或字节数变了）会自动重建；删掉也能自动重建。
+- `reading_next` 的返回里带 `tocPath`，能看到表在哪。
+- `reading_search` 还是要整本，它是搜全文的。
 
 ## License
 

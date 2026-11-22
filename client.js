@@ -54,7 +54,17 @@ window.__ModuleLoader__.load({
           ch = { title: line.replace(/^###\s+/, '').trim(), lines: [] }
           if (book) book.chapters.push(ch)
         } else if (/^[-*]\s+/.test(line)) {
-          if (ch) ch.lines.push(line.replace(/^[-*]\s+/, ''))
+          if (ch) {
+            const t = line.replace(/^[-*]\s+/, '')
+            ch.lines.push(t)
+            // 署名行里带着时间：- ↳ 来自：鹿野 · 2026-11-10 20:31
+            if (/^↳/.test(t)) {
+              const m = t.match(/(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})/)
+              if (m) ch.at = m[1] + ' ' + m[2]
+              const b = t.replace(/^\u21b3\s*\u6765\u81ea\uff1a/, '').split('\u00b7')[0].trim()
+              if (b) ch.by = b
+            }
+          }
         }
       }
       return out
@@ -76,7 +86,9 @@ window.__ModuleLoader__.load({
     return n + cur
   }
   const chapterNo = (title) => {
-    const m = String(title || '').match(/第([0-9０-９零〇一二三四五六七八九十百千两]+)章/)
+    // 标题可能是「第 3–7 章」（带空格与范围），所以先去空格再取第一个数字
+    const t = String(title || '').replace(/\s+/g, '')
+    const m = t.match(/第([0-9０-９零〇一二三四五六七八九十百千两]+)/)
     return m ? cnNum(m[1]) : NaN
   }
   // 有几章、从第几章到第几章（章名认不出数字就不显示范围）
@@ -322,8 +334,16 @@ window.__ModuleLoader__.load({
             const total = bk.chapters.length
             const pages = Math.max(1, Math.ceil(total / NOTE_PAGE))
             const page = Math.min(v.page || 0, pages - 1)
-            const list = all ? bk.chapters : bk.chapters.slice(page * NOTE_PAGE, page * NOTE_PAGE + NOTE_PAGE)
+            // 排序：章节升 / 章节降 / 时间新在前（没写时间的排在后面）
+            const sortLabels = ['章节 \u2191', '章节 \u2193', '时间 \u2193']
+            const sortMode = (v.sort === undefined ? ((state && state.noteSort) || 0) : v.sort) % 3
+            const sorted = bk.chapters.slice()
+            if (sortMode === 1) sorted.sort((a, b) => (chapterNo(b.title) || -1) - (chapterNo(a.title) || -1))
+            else if (sortMode === 2) sorted.sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')))
+            else sorted.sort((a, b) => (chapterNo(a.title) || 1e9) - (chapterNo(b.title) || 1e9))
+            const list = all ? sorted : sorted.slice(page * NOTE_PAGE, page * NOTE_PAGE + NOTE_PAGE)
             const setView = (patch) => setNoteView(Object.assign({}, noteView, { [bi]: Object.assign({}, v, patch) }))
+            const saveSort = (n) => { try { getJson('/dsh-reading.notesort', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sort: n }) }) } catch (e) {} }
             const paged = total > NOTE_PAGE
             const tabs = h('div', { style: { ...S.row, gap: 6, marginBottom: 8, flexWrap: 'wrap' } },
               notes.map((n, ni) => h('button', {
@@ -341,8 +361,10 @@ window.__ModuleLoader__.load({
                 paged ? h('div', { style: { ...S.dim, minWidth: 46, textAlign: 'center' } }, all ? '全部' : ((page + 1) + ' / ' + pages)) : null,
                 paged ? h('button', { style: S.btn, disabled: all || page >= pages - 1, onClick: () => setView({ page: page + 1 }) }, '›') : null,
                 paged ? h('button', { style: all ? S.btnOn : S.btn, onClick: () => setView({ all: !all, page: 0 }) }, all ? '分页' : '全部') : null,
+                h('button', { style: S.btnOn, onClick: () => { const next = (sortMode + 1) % 3; setView({ sort: next, page: 0 }); saveSort(next) } }, sortLabels[sortMode]),
                 h('button', { style: S.btn, onClick: () => copy(bk.chapters.map((c) => '## ' + c.title + '\n' + c.lines.join('\n')).join('\n\n')) }, '复制这本'),
               ),
+              (sortMode === 2 && bk.chapters.filter((c) => !c.at).length) ? h('div', { style: { ...S.dim, marginBottom: 6 } }, '有 ' + bk.chapters.filter((c) => !c.at).length + ' 段早期笔记当时没记时间，排在最后。') : null,
               list.map((c, ci) => h('div', { key: ci, style: { marginBottom: 6 } },
                 h('div', { style: S.row },
                   h('div', { style: { ...S.dim, color: C.warn } }, c.title),
