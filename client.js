@@ -114,6 +114,14 @@ window.__ModuleLoader__.load({
       const [recent, setRecent] = useState(null)
       const [noteView, setNoteView] = useState({})
       const [bookAct, setBookAct] = useState(0)
+      // 大图查看器：面板跑在 iframe 里，window.open 会被拦，所以自己在面板内弹一层
+      const [viewer, setViewer] = useState(null)
+      useEffect(() => {
+        if (!viewer) return undefined
+        const onKey = (e) => { if (e.key === 'Escape') setViewer(null) }
+        window.addEventListener('keydown', onKey)
+        return () => window.removeEventListener('keydown', onKey)
+      }, [viewer])
       const NOTE_PAGE = 10
       let importPath = ''
 
@@ -424,7 +432,7 @@ window.__ModuleLoader__.load({
               h('div', {
                 style: { cursor: 'zoom-in', lineHeight: 0, background: 'rgba(0,0,0,0.15)' },
                 title: m.path,
-                onClick: () => window.open(m.url, '_blank'),
+                onClick: () => setViewer(m),
               }, h('img', {
                 src: m.url,
                 alt: m.name,
@@ -567,10 +575,30 @@ window.__ModuleLoader__.load({
           : null,
       )
 
+      const viewerLayer = viewer ? h('div', {
+        style: {
+          position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(10,14,22,0.86)',
+          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+          gap: 10, padding: 20, cursor: 'zoom-out',
+        },
+        onClick: () => setViewer(null),
+      },
+        h('img', {
+          src: viewer.url,
+          alt: viewer.name,
+          onClick: (e) => e.stopPropagation(),
+          style: { maxWidth: '94vw', maxHeight: '84vh', objectFit: 'contain', borderRadius: 6, boxShadow: '0 12px 48px rgba(0,0,0,0.55)', background: '#fff', minWidth: 120, cursor: 'default' },
+        }),
+        h('div', { style: { color: '#e8eef8', fontSize: 12, textAlign: 'center', maxWidth: '90vw', wordBreak: 'break-all' } },
+          viewer.name + (viewer.width && viewer.height ? ' · ' + viewer.width + '×' + viewer.height : '') + ' · ' + fmt(viewer.size) + '　（点空白或按 Esc 关闭）'),
+        h('div', { style: { color: 'rgba(232,238,248,0.55)', fontSize: 11, maxWidth: '90vw', wordBreak: 'break-all' } }, viewer.rel || ''),
+      ) : null
+
       return h('div', { style: S.wrap },
         head,
         tabs,
         tab === 'read' ? readTab : tab === 'works' ? worksTab : tab === 'fav' ? favTab : setTabView,
+        viewerLayer,
       )
     }
 
