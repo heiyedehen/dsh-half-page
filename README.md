@@ -54,6 +54,7 @@ dsh plugin add dsh-half-page
 |---|---|
 | `reading_shelf` | 书架与进度 |
 | `reading_next` | 打开下一章（或指定章） |
+| `reading_mark` | 只记进度、不返回正文：已读到第 N 章（自己切文件读完整章时用它补记） |
 | `reading_note` | 给这章写一两句读后感，可带 `by` |
 | `reading_search` | 在书里搜词，返回第几章、哪一行 |
 | `reading_recap` | 已读部分压成一页 |

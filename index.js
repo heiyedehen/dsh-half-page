@@ -272,6 +272,27 @@ export async function listBooks(dir) {
   return out
 }
 
+/** 只读章表，不存在就返回 null（不触发建表） */
+async function readTocOnly(dir, id) {
+  const t = await readJson(tocPath(dir, id), null)
+  return t && t.version === TOC_VERSION && Array.isArray(t.chapters) ? t : null
+}
+
+/** 书名匹配：先精确 id，再书名精确，再片段（唯一命中才算认出） */
+export function resolveBookId(st, shelf, query) {
+  const key = String(query || '').trim()
+  if (!key) throw new Error('没有这本书：')
+  const ids = shelf.map((b) => b.id)
+  if (ids.includes(key)) return key
+  const books = st.books || {}
+  const exact = ids.filter((id) => (books[id]?.title || id) === key)
+  if (exact.length === 1) return exact[0]
+  const hits = ids.filter((id) => id.includes(key) || String(books[id]?.title || '').includes(key))
+  if (hits.length === 1) return hits[0]
+  if (hits.length > 1) throw new Error(`书名不唯一：${key}（可能是 ${hits.join(' / ')}）`)
+  throw new Error(`没有这本书：${key}`)
+}
+
 /** 打开某本书：优先用章表（不整本 decode），没有章表才扫一遍并落盘 */
 export async function bookInfo(dir, id) {
   const toc = await tocFor(dir, id)
@@ -1062,6 +1083,47 @@ async function signWork(rel, who) {
           left: Math.max(0, perDay - rt - 1),
           text: body,
         }
+      },
+    }),
+  )
+
+  ctx.effect(() =>
+    ctx.tools.register({
+      name: 'reading_mark',
+      description:
+        '只记进度、不返回正文：把某本书记成「已读到第 N 章」。'
+        + '适合自己把整章切出去读完之后补记——绕开 reading_next 也不会让进度停在旧章。'
+        + '已读到只进不退（跳读可以，回退不会把进度改小）。',
+      parameters: obj({
+        book: { type: 'string', description: '书名或书名片段，比如 雪中、诡秘之主、古文观止' },
+        chapter: { type: 'number', description: '刚读完的章号（从 1 开始）' },
+        todayCount: { type: 'number', description: '这一拍实际读了几章，默认 1，累加到今天的计数' },
+      }),
+      output: textOut,
+      async execute(args) {
+        const { dir, st, shelf } = await stateOf()
+        const id = resolveBookId(st, shelf, args?.book)
+        // 只认已有章表里的章数；没有章表就不建，也不拦（reading_mark 不碰章表）
+        const toc = await readTocOnly(dir, id)
+        const chapters = toc ? toc.chapters.length : Number(st.books?.[id]?.chapters) || 0
+        const n = Math.floor(Number(args?.chapter))
+        if (!(n >= 1)) throw new Error('章号要从 1 开始')
+        if (chapters && n > chapters) throw new Error(`章号超出范围：1–${chapters}`)
+        const incRaw = Math.floor(Number(args?.todayCount))
+        const inc = Number.isFinite(incRaw) && incRaw > 0 ? incRaw : 1
+        const rec = st.books[id] || (st.books[id] = { id, title: id, chapters, readThrough: 0, next: 1 })
+        const before = Number(rec.readThrough) || 0
+        if (chapters) rec.chapters = chapters
+        rec.readThrough = Math.max(before, n)
+        rec.next = chapters ? Math.min(chapters, rec.readThrough + 1) : rec.readThrough + 1
+        rec.lastReadAt = new Date().toISOString()
+        st.current = id
+        const t = today()
+        st.log = st.log || {}
+        st.log[t] = st.log[t] || {}
+        st.log[t][id] = (Number(st.log[t][id]) || 0) + inc
+        await saveState(dir, st)
+        return `ok readThrough ${before} -> ${rec.readThrough} next ${rec.next} today ${st.log[t][id] || 0}`
       },
     }),
   )
