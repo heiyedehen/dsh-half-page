@@ -2,7 +2,7 @@
 // 宿主侧：书库、切章、读后感、进度；客户端面板读 HTTP 路由。
 import { readFile, writeFile, mkdir, readdir, stat, rename, open } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
-import { join, basename, dirname, extname, resolve } from 'node:path'
+import { join, basename, dirname, extname, resolve, relative, isAbsolute } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 
@@ -513,20 +513,24 @@ export async function imageRoots(worksDir) {
   const cfg = await config()
   const listed = Array.isArray(cfg.imgDirs) ? cfg.imgDirs.filter((p) => typeof p === 'string' && p.trim()) : []
   const roots = []
-  if (listed.length) {
-    for (const p of listed) {
-      try {
-        const s = await stat(p)
-        if (s.isDirectory()) roots.push(resolve(p))
-      } catch {}
-    }
-    return roots
+  // 叠加，不覆盖：作品目录永远在，imgDirs 只是额外加几处
+  const add = async (p) => {
+    try {
+      const s = await stat(p)
+      if (!s.isDirectory()) return
+      const abs = resolve(p)
+      if (roots.includes(abs)) return
+      roots.push(abs)
+    } catch {}
   }
-  try {
-    const s = await stat(worksDir)
-    if (s.isDirectory()) roots.push(resolve(worksDir))
-  } catch {}
-  return roots
+  await add(worksDir)
+  for (const p of listed) await add(p)
+  // 被别的根整个包含的，丢掉：作品目录已经扫到 作品/画，再单列一次就是同一张图两遍
+  const inside = (child, parent) => {
+    const rel = relative(parent, child)
+    return Boolean(rel) && !rel.startsWith('..') && !isAbsolute(rel)
+  }
+  return roots.filter((r) => !roots.some((other) => other !== r && inside(r, other)))
 }
 
 /* ---------------- HTTP 与工具 ---------------- */
@@ -745,7 +749,15 @@ async function signWork(rel, who) {
         // 图片另算一块：作品目录 + art，跳过 archive；超 10MB 的不列
         const roots = await imageRoots(root)
         let images = []
-        for (const r of roots) images = images.concat(await scanImages(r, r === resolve(root) ? 'works' : 'art'))
+        const seen = new Set()
+        for (const r of roots) {
+          for (const img of await scanImages(r, r === resolve(root) ? 'works' : 'art')) {
+            const key = img.path.toLowerCase()
+            if (seen.has(key)) continue
+            seen.add(key)
+            images.push(img)
+          }
+        }
         images.sort((a, b) => b.mtime.localeCompare(a.mtime))
         res.end(JSON.stringify({ ok: true, root, roots, files: out, images }))
       },

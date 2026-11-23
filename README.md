@@ -52,7 +52,7 @@ dsh plugin add dsh-half-page
 `~/.dsh/reading.config.json` 是可选的，面板里改设置也会写到这里。常用的几个键：
 
 - `worksDir`：作品目录（不填就是 `~/.dsh/reading/作品`）
-- `imgDirs`：额外要列出来的图片目录（数组，默认空；不填就只扫作品目录，一层 + 一层子目录）
+- `imgDirs`：额外要列出来的图片目录（数组，默认空；叠加在作品目录之上，被包含的子目录自动去重，不存在的路径跳过）
 - `perDay` / `quietFrom` / `quietTo`：每日上限与安静时段
 
 ## 工具
