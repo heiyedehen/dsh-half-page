@@ -412,6 +412,113 @@ export async function appendNote(dir, bookTitle, chapterTitle, lines, by) {
   return p
 }
 
+/* ---------------- 图片：作品与画 ------------------
+ * 只扫固定几个目录（作品目录、同级的 art），递归但跳过 archive / 缓存目录；
+ * 单张超 MAX_IMAGE_BYTES 直接跳过（不读、不加载）。
+ */
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024
+const IMAGE_EXT_RE = /\.(png|jpe?g|webp)$/i
+const IMAGE_SKIP_DIRS = new Set(['archive', '.trash', 'node_modules', '.git', 'tmp', 'cache'])
+
+/** 只读文件头，认 PNG / JPEG / WebP 的像素尺寸；认不出返回 null */
+export async function imageSizeOf(file) {
+  let buf
+  try {
+    const fh = await open(file, 'r')
+    try {
+      buf = Buffer.alloc(256 * 1024)
+      const { bytesRead } = await fh.read(buf, 0, buf.length, 0)
+      buf = buf.subarray(0, bytesRead)
+    } finally { await fh.close() }
+  } catch { return null }
+  try {
+    // PNG: 8 字节签名 + IHDR
+    if (buf.length > 24 && buf.readUInt32BE(0) === 0x89504e47) {
+      return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) }
+    }
+    // WebP
+    if (buf.length > 30 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') {
+      const fourcc = buf.toString('ascii', 12, 16)
+      if (fourcc === 'VP8 ') return { width: buf.readUInt16LE(26) & 0x3fff, height: buf.readUInt16LE(28) & 0x3fff }
+      if (fourcc === 'VP8L') {
+        const b = buf.readUInt32LE(21)
+        return { width: (b & 0x3fff) + 1, height: ((b >> 14) & 0x3fff) + 1 }
+      }
+      if (fourcc === 'VP8X') {
+        return { width: buf.readUIntLE(24, 3) + 1, height: buf.readUIntLE(27, 3) + 1 }
+      }
+    }
+    // JPEG: 找 SOF 段
+    if (buf.length > 4 && buf[0] === 0xff && buf[1] === 0xd8) {
+      let i = 2
+      while (i + 9 < buf.length) {
+        if (buf[i] !== 0xff) { i++; continue }
+        const m = buf[i + 1]
+        if (m === 0xd8 || m === 0x01 || (m >= 0xd0 && m <= 0xd7)) { i += 2; continue }
+        const len = buf.readUInt16BE(i + 2)
+        if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) {
+          return { height: buf.readUInt16BE(i + 5), width: buf.readUInt16BE(i + 7) }
+        }
+        i += 2 + len
+      }
+    }
+  } catch {}
+  return null
+}
+
+function imageMimeOf(name) {
+  const e = extname(name).toLowerCase()
+  if (e === '.png') return 'image/png'
+  if (e === '.webp') return 'image/webp'
+  return 'image/jpeg'
+}
+
+/** 在 root 下递归找图（跳过 archive 一类目录），按 mtime 倒序 */
+export async function scanImages(root, kind) {
+  const out = []
+  const walk = async (p, rel) => {
+    let list = []
+    try { list = await readdir(p, { withFileTypes: true }) } catch { return }
+    for (const d of list) {
+      if (d.name.startsWith('.')) continue
+      const abs = join(p, d.name)
+      const r = rel ? rel + '/' + d.name : d.name
+      if (d.isDirectory()) {
+        if (IMAGE_SKIP_DIRS.has(d.name.toLowerCase())) continue
+        await walk(abs, r)
+        continue
+      }
+      if (!IMAGE_EXT_RE.test(d.name)) continue
+      let s
+      try { s = await stat(abs) } catch { continue }
+      if (!s.isFile() || s.size > MAX_IMAGE_BYTES) continue
+      const size = await imageSizeOf(abs)
+      out.push({
+        kind, root, rel: r, name: d.name, path: abs, size: s.size, mtime: s.mtime.toISOString(),
+        width: size ? size.width : 0, height: size ? size.height : 0,
+        url: '/dsh-reading.image?path=' + encodeURIComponent(abs),
+      })
+    }
+  }
+  await walk(root, '')
+  return out
+}
+
+/** 允许给浏览器读的图片根：作品目录 + 同级/配置里的 art */
+export async function imageRoots(worksDir) {
+  const roots = [resolve(worksDir)]
+  const cfg = await config()
+  const cands = [cfg.artDir, join(dirname(dirname(resolve(worksDir))), 'art'), join(homedir(), 'dsh work', 'art')]
+  for (const p of cands) {
+    if (!p) continue
+    try {
+      const s = await stat(p)
+      if (s.isDirectory()) { roots.push(resolve(p)); break }
+    } catch {}
+  }
+  return roots
+}
+
 /* ---------------- HTTP 与工具 ---------------- */
 
 export function apply(ctx) {
@@ -625,7 +732,40 @@ async function signWork(rel, who) {
         }
         await walk(root, '')
         out.sort((a, b) => b.mtime.localeCompare(a.mtime))
-        res.end(JSON.stringify({ ok: true, root, files: out }))
+        // 图片另算一块：作品目录 + art，跳过 archive；超 10MB 的不列
+        const roots = await imageRoots(root)
+        let images = []
+        for (const r of roots) images = images.concat(await scanImages(r, r === resolve(root) ? 'works' : 'art'))
+        images.sort((a, b) => b.mtime.localeCompare(a.mtime))
+        res.end(JSON.stringify({ ok: true, root, roots, files: out, images }))
+      },
+    }),
+  )
+
+  // 给面板读一张图（限制在上面那几个根里）
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/dsh-reading.image',
+      async handler(req, res) {
+        try {
+          const u = new URL(req.url, 'http://x')
+          const p = resolve(String(u.searchParams.get('path') || ''))
+          const root = await worksDir()
+          const roots = await imageRoots(root)
+          const n = (x) => x.replace(/\\/g, '/').toLowerCase()
+          const inside = roots.some((r) => n(p) === n(r) || n(p).startsWith(n(r) + '/'))
+          if (!inside) { res.statusCode = 403; return res.end('forbidden') }
+          if (!IMAGE_EXT_RE.test(p)) { res.statusCode = 400; return res.end('not an image') }
+          const s = await stat(p)
+          if (s.size > MAX_IMAGE_BYTES) { res.statusCode = 413; return res.end('too large') }
+          res.setHeader('content-type', imageMimeOf(p))
+          res.setHeader('cache-control', 'private, max-age=60')
+          res.end(await readFile(p))
+        } catch (e) {
+          res.statusCode = 404
+          res.end(String((e && e.message) || e))
+        }
       },
     }),
   )
