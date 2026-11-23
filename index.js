@@ -67,6 +67,7 @@ export function today() {
    配了 "HH:MM" 的 quietFrom / quietTo 才算数；空值、格式不对、两边相同，一律当没设。
    from > to 表示跨夜（22:00–06:00）。用本地时间判断，不用 UTC。 */
 export function quietWindowOf(cfg) {
+  if (cfg?.quietEnabled === false) return null
   const parse = (v) => {
     const s = typeof v === 'string' ? v.trim() : ''
     const m = /^(\d{1,2}):(\d{2})$/.exec(s)
