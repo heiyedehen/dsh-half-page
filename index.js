@@ -63,6 +63,33 @@ export function today() {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
 }
 
+/* 静音时段：只管 reading_next（真正返回正文的那一步）。
+   配了 "HH:MM" 的 quietFrom / quietTo 才算数；空值、格式不对、两边相同，一律当没设。
+   from > to 表示跨夜（22:00–06:00）。用本地时间判断，不用 UTC。 */
+export function quietWindowOf(cfg) {
+  const parse = (v) => {
+    const s = typeof v === 'string' ? v.trim() : ''
+    const m = /^(\d{1,2}):(\d{2})$/.exec(s)
+    if (!m) return null
+    const h = Number(m[1])
+    const mi = Number(m[2])
+    if (h > 23 || mi > 59) return null
+    return { min: h * 60 + mi, text: s }
+  }
+  const a = parse(cfg?.quietFrom)
+  const b = parse(cfg?.quietTo)
+  if (!a || !b || a.min === b.min) return null
+  return { from: a.min, to: b.min, fromText: a.text, toText: b.text }
+}
+
+export function inQuietNow(cfg, now = new Date()) {
+  const w = quietWindowOf(cfg)
+  if (!w) return null
+  const cur = now.getHours() * 60 + now.getMinutes()
+  const hit = w.from < w.to ? cur >= w.from && cur < w.to : cur >= w.from || cur < w.to
+  return hit ? w : null
+}
+
 async function readJson(p, d) {
   try {
     return JSON.parse(stripBom(await readFile(p, 'utf8')))
@@ -1207,13 +1234,19 @@ async function signWork(rel, who) {
       description:
         '打开下一章（或指定章），返回这一章的正文和元信息。'
         + '它会把这章记为「已读到」，不会自动写读后感——读完想说什么，用 reading_note 记两行。'
-        + '超过每日上限时会提示，但仍允许读（上限是提醒不是锁）。',
+        + '超过每日上限时会提示，但仍允许读（上限是提醒不是锁）。'
+        + '配置了静音时段时，这段时间内会被拒绝；真要读就传 force: true。',
       parameters: obj({
         book: { type: 'string', description: '书名 id（不填=当前正在读的那本）' },
         chapter: { type: 'number', description: '第几章（不填=接着上次的下一章）' },
+        force: { type: 'boolean', description: '静音时段内仍然要读，传 true（默认 false）' },
       }),
       output: textOut,
       async execute(args) {
+        if (args?.force !== true) {
+          const q = inQuietNow(await config())
+          if (q) throw new Error(`静音时段（${q.fromText}–${q.toText}），不自动读。真要读请传 force: true`)
+        }
         const { dir, perDay, st, readToday: rt } = await stateOf()
         const id = args?.book || st.current
         if (!id) throw new Error('书架是空的：先用 reading_import 导入一本 txt')
