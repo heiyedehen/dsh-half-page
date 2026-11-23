@@ -1273,7 +1273,19 @@ async function signWork(rel, who) {
         st.log[t] = st.log[t] || {}
         st.log[t][id] = (Number(st.log[t][id]) || 0) + inc
         await saveState(dir, st)
-        return `ok readThrough ${before} -> ${rec.readThrough} next ${rec.next} today ${st.log[t][id] || 0}`
+        const todayCount = Number(st.log[t][id]) || 0
+        // textOut 的 schema 是 object，必须返回对象（以前返回字符串，工具报 "value" must be an object）
+        return {
+          ok: true,
+          book: rec.title || id,
+          id,
+          before,
+          readThrough: rec.readThrough,
+          next: rec.next,
+          chapters: chapters || null,
+          today: todayCount,
+          text: `ok readThrough ${before} -> ${rec.readThrough} next ${rec.next} today ${todayCount}`,
+        }
       },
     }),
   )
