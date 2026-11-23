@@ -473,10 +473,10 @@ function imageMimeOf(name) {
   return 'image/jpeg'
 }
 
-/** 在 root 下递归找图（跳过 archive 一类目录），按 mtime 倒序 */
-export async function scanImages(root, kind) {
+/** 在 root 下找图（跳过 archive 一类目录，默认只下潜一层），按 mtime 倒序 */
+export async function scanImages(root, kind, maxDepth = 1) {
   const out = []
-  const walk = async (p, rel) => {
+  const walk = async (p, rel, depth) => {
     let list = []
     try { list = await readdir(p, { withFileTypes: true }) } catch { return }
     for (const d of list) {
@@ -485,7 +485,8 @@ export async function scanImages(root, kind) {
       const r = rel ? rel + '/' + d.name : d.name
       if (d.isDirectory()) {
         if (IMAGE_SKIP_DIRS.has(d.name.toLowerCase())) continue
-        await walk(abs, r)
+        if (depth >= maxDepth) continue
+        await walk(abs, r, depth + 1)
         continue
       }
       if (!IMAGE_EXT_RE.test(d.name)) continue
@@ -500,22 +501,31 @@ export async function scanImages(root, kind) {
       })
     }
   }
-  await walk(root, '')
+  await walk(root, '', 0)
   return out
 }
 
-/** 允许给浏览器读的图片根：作品目录 + 同级/配置里的 art */
+/**
+ * 允许给浏览器读的图片根：优先配置里的 imgDirs（数组，默认空），
+ * 没配就跟着作品目录同源——没有任何绝对路径，别人的机器上不会指向我这儿。
+ */
 export async function imageRoots(worksDir) {
-  const roots = [resolve(worksDir)]
   const cfg = await config()
-  const cands = [cfg.artDir, join(dirname(dirname(resolve(worksDir))), 'art'), join(homedir(), 'dsh work', 'art')]
-  for (const p of cands) {
-    if (!p) continue
-    try {
-      const s = await stat(p)
-      if (s.isDirectory()) { roots.push(resolve(p)); break }
-    } catch {}
+  const listed = Array.isArray(cfg.imgDirs) ? cfg.imgDirs.filter((p) => typeof p === 'string' && p.trim()) : []
+  const roots = []
+  if (listed.length) {
+    for (const p of listed) {
+      try {
+        const s = await stat(p)
+        if (s.isDirectory()) roots.push(resolve(p))
+      } catch {}
+    }
+    return roots
   }
+  try {
+    const s = await stat(worksDir)
+    if (s.isDirectory()) roots.push(resolve(worksDir))
+  } catch {}
   return roots
 }
 
