@@ -1,4 +1,11 @@
 - insert:
     - id: dsh-half-page
       name: dsh-half-page
-      config: {}
+      config:
+        studyEnabled: false
+        studyFrom: ""
+        studyTo: ""
+        studyPerWeek: 3
+        studyPerDay: 1
+        studyMode: "week"
+        studySession: ""

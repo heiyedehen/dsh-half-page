@@ -5,8 +5,10 @@ import { readFileSync } from 'node:fs'
 import { join, basename, dirname, extname, resolve, relative, isAbsolute } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
+import { readTimeline, newestSessionId } from './lib/session-probe.js'
+import { loadCreateUserMessage, SOURCE_KIND } from './lib/notice.js'
 
-export const inject = ['webServer', 'tools', 'systemPrompt']
+export const inject = ['webServer', 'tools', 'systemPrompt', 'agents', 'sessions']
 
 const HOME = process.env.USERPROFILE || process.env.HOME || homedir()
 const CONFIG = join(HOME, '.dsh', 'reading.config.json')
@@ -31,13 +33,16 @@ export async function readTextSmart(buf) {
   }
 }
 
+/** cordis.patch.yml 里 config 的默认值；reading.config.json 优先 */
+let PATCH_CFG = {}
+
 export async function config() {
   try {
     const raw = await readFile(CONFIG, 'utf8')
     const c = JSON.parse(stripBom(raw)) || {}
-    return { ...c, dir: c.dir || DEFAULT_DIR, perDay: Number(c.perDay) > 0 ? Number(c.perDay) : 3 }
+    return { ...PATCH_CFG, ...c, dir: c.dir || DEFAULT_DIR, perDay: Number(c.perDay) > 0 ? Number(c.perDay) : 3 }
   } catch {
-    return { dir: DEFAULT_DIR, perDay: 3 }
+    return { ...PATCH_CFG, dir: DEFAULT_DIR, perDay: 3 }
   }
 }
 
@@ -130,6 +135,127 @@ export function chapterText(text, chapters, n) {
   const c = chapters[n - 1]
   if (!c) return ''
   return text.slice(c.start, c.end).trim()
+}
+
+/* ---------------- 书房时间：到点只叫一声，读不读由它自己决定 ----------------
+   刻意做得极克制：默认关、一句固定的话、不带书名不带进度、不写批注提醒。
+   绝不在这里调 reading_next —— 一旦替它决定读不读，这个功能就废了。 */
+
+export const STUDY_TEXT = '书房时间到了。读不读随你。'
+const STUDY_GRACE_MIN = 5
+const STUDY_NOTICE_QUIET_MIN = 10
+
+function studyMinute(v) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(v || '').trim())
+  if (!m) return null
+  const h = Number(m[1])
+  const mi = Number(m[2])
+  if (h > 23 || mi > 59) return null
+  return h * 60 + mi
+}
+
+/** 合法且起止不同才算设了时段；返 {from,to}（分钟）或 null */
+export function studyWindowOf(cfg) {
+  const from = studyMinute(cfg?.studyFrom)
+  const to = studyMinute(cfg?.studyTo)
+  if (from === null || to === null || from === to) return null
+  return { from, to }
+}
+
+/** [from, to) 本地时间，from > to 表示跨夜 */
+export function inStudyWindow(w, now = new Date()) {
+  if (!w) return false
+  const cur = now.getHours() * 60 + now.getMinutes()
+  return w.from < w.to ? cur >= w.from && cur < w.to : cur >= w.from || cur < w.to
+}
+
+/** ISO 周（YYYY-Www），跨周归零用 */
+export function weekKeyOf(ms) {
+  const d = new Date(ms)
+  const t = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()))
+  const day = t.getUTCDay() || 7
+  t.setUTCDate(t.getUTCDate() + 4 - day)
+  const yearStart = new Date(Date.UTC(t.getUTCFullYear(), 0, 1))
+  const week = Math.ceil(((t - yearStart) / 86400000 + 1) / 7)
+  return `${t.getUTCFullYear()}-W${String(week).padStart(2, '0')}`
+}
+
+function localDayOf(ms) {
+  const d = new Date(ms)
+  const p = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+/** 读 state.study；跨周了计数归零 */
+export function studyStateOf(st, now = Date.now()) {
+  const raw = st?.study ?? {}
+  const week = weekKeyOf(now)
+  const sameWeek = raw.week === week
+  const day = localDayOf(now)
+  const sameDay = raw.day === day
+  return {
+    lastAt: Number(raw.lastAt) || 0,
+    week,
+    weekCount: sameWeek ? Number(raw.weekCount) || 0 : 0,
+    day,
+    dayCount: sameDay ? Number(raw.dayCount) || 0 : 0,
+  }
+}
+
+/** 今天有没有读过（任一书的 lastReadAt 落在本地今天） */
+export function readSomethingToday(st, now = Date.now()) {
+  const day = localDayOf(now)
+  for (const rec of Object.values(st?.books ?? {})) {
+    const at = rec?.lastReadAt
+    const ms = typeof at === 'number' ? at : Date.parse(String(at || ''))
+    if (Number.isFinite(ms) && ms > 0 && localDayOf(ms) === day) return true
+  }
+  return false
+}
+
+export function studyPerWeekOf(cfg) {
+  const n = Number(cfg?.studyPerWeek)
+  if (!Number.isFinite(n)) return 3
+  return Math.min(7, Math.max(1, Math.floor(n)))
+}
+
+/** 每天叫几次（day 模式用） */
+export function studyPerDayOf(cfg) {
+  const n = Number(cfg?.studyPerDay)
+  if (!Number.isFinite(n)) return 1
+  return Math.min(7, Math.max(1, Math.floor(n)))
+}
+
+/** 'day' 或 'week'（缺省 week，老配置行为不变） */
+export function studyModeOf(cfg) {
+  return cfg?.studyMode === 'day' ? 'day' : 'week'
+}
+
+/**
+ * 全部满足才返回 { ok: true }；一条不满足就给个理由（写日志用，不往界面抛）。
+ * timeline 来自会话日志：{ ok, lastUserAt, lastAssistantAt, lastNoticeAt }
+ */
+export function decideStudy({ cfg, study, now, timeline }) {
+  if (cfg?.studyEnabled !== true) return { ok: false, reason: 'off' }
+  const w = studyWindowOf(cfg)
+  if (!w) return { ok: false, reason: 'no-window' }
+  if (!inStudyWindow(w, new Date(now))) return { ok: false, reason: 'outside' }
+  const mode = studyModeOf(cfg)
+  if (mode === 'day') {
+    if ((Number(study.dayCount) || 0) >= studyPerDayOf(cfg)) return { ok: false, reason: 'day-budget' }
+  } else {
+    if (study.lastAt && localDayOf(study.lastAt) === localDayOf(now)) return { ok: false, reason: 'today-called' }
+    if (study.weekCount >= studyPerWeekOf(cfg)) return { ok: false, reason: 'week-budget' }
+  }
+  if (!timeline?.ok) return { ok: false, reason: `no-log（${timeline?.error || 'unknown'}）` }
+  const userAt = Number(timeline.lastUserAt) || 0
+  const assistantAt = Number(timeline.lastAssistantAt) || 0
+  if (!userAt) return { ok: false, reason: 'no-user' }
+  if (now - userAt < STUDY_GRACE_MIN * 60000) return { ok: false, reason: 'too-soon' }
+  if (!(assistantAt > userAt)) return { ok: false, reason: 'unanswered' }
+  const noticeAt = Number(timeline.lastNoticeAt) || 0
+  if (noticeAt && now - noticeAt < STUDY_NOTICE_QUIET_MIN * 60000) return { ok: false, reason: 'recent-notice' }
+  return { ok: true, reason: 'ok' }
 }
 
 /* ------------------------------------------------------------------ 章表
@@ -563,7 +689,127 @@ export async function imageRoots(worksDir) {
 
 /* ---------------- HTTP 与工具 ---------------- */
 
-export function apply(ctx) {
+export function apply(ctx, rawConfig) {
+  PATCH_CFG = rawConfig && typeof rawConfig === 'object' ? rawConfig : {}
+
+  /* ---------------- 书房时间：定时那一半 ---------------- */
+  const SESSIONS_ROOT = join(HOME, '.dsh', 'sessions')
+  const SESSIONS_PROJ_ROOT = join(HOME, '.dsh', 'storages', 'session_projcache', 'sessions')
+  let studyTimer
+  let studyBusy = false
+  let studyDisposed = false
+  let studyCreate = null
+  const studyReady = loadCreateUserMessage(() => {}).then((fn) => { studyCreate = fn })
+
+  async function resolveAgent(sessionId) {
+    const live = ctx.agents?.get?.(sessionId)
+    if (live) return live
+    try {
+      const resolved = await ctx.sessionController?.resolveAgent?.(sessionId)
+      if (resolved && resolved.agent) return resolved.agent
+    } catch {}
+    return null
+  }
+
+  /** 会话标题（存在 projcache 里）；读不到就空 */
+  async function sessionTitleOf(sessionId) {
+    try {
+      const raw = await readFile(join(SESSIONS_PROJ_ROOT, `${sessionId}.json`), 'utf8')
+      const t = JSON.parse(raw)?.record?.rows?.title?.val
+      return typeof t === 'string' ? t : ''
+    } catch {
+      return ''
+    }
+  }
+
+  /** 现在开着的会话（给面板「在哪条会话叫」下拉用）；拿不到就空 */
+  async function liveSessionList() {
+    const out = []
+    try {
+      const arr = typeof ctx.agents?.list === 'function' ? ctx.agents.list() : []
+      for (const a of arr ?? []) {
+        const id = a?.session?.id ?? a?.id
+        if (!id) continue
+        if (a?.session?.header?.origin === 'subagent') continue
+        const fromHeader = a?.session?.header?.title || a?.session?.title || ''
+        const title = fromHeader || await sessionTitleOf(String(id))
+        out.push({ id: String(id), title: String(title || '') })
+      }
+    } catch {
+      return []
+    }
+    return out
+  }
+
+  /** 只投那一句；成功才返回 { ok, at } */
+  async function deliverStudy(sessionId) {
+    const agent = await resolveAgent(sessionId)
+    if (!agent) return { ok: false, reason: 'no-session' }
+    await studyReady
+    const message = studyCreate({
+      content: [{ type: 'text', text: STUDY_TEXT }],
+      source: { kind: SOURCE_KIND, form: 'notice', summary: STUDY_TEXT },
+    })
+    try {
+      await agent.followup(message)
+    } catch (error) {
+      return { ok: false, reason: String(error?.message || error) }
+    }
+    try {
+      const flushed = await ctx.sessions.flush(agent.session)
+      if (flushed === false) return { ok: false, reason: 'flush-failed' }
+    } catch (error) {
+      return { ok: false, reason: String(error?.message || error) }
+    }
+    return { ok: true, at: Date.now() }
+  }
+
+  async function studyTick() {
+    if (studyDisposed || studyBusy) return
+    studyBusy = true
+    try {
+      const cfgNow = await config()
+      if (cfgNow.studyEnabled !== true) return
+      const dir = cfgNow.dir
+      const st = await loadState(dir)
+      const now = Date.now()
+      const study = studyStateOf(st, now)
+      if (readSomethingToday(st, now)) return
+      const sessionId = cfgNow.studySession || await newestSessionId(SESSIONS_ROOT)
+      if (!sessionId) return
+      const timeline = await readTimeline(SESSIONS_ROOT, sessionId, { tailFrames: 200 })
+      const verdict = decideStudy({ cfg: cfgNow, study, now, timeline })
+      if (!verdict.ok) return
+      const sent = await deliverStudy(sessionId)
+      if (!sent.ok) return
+      await ensureDir(dir)
+      st.study = {
+        lastAt: sent.at,
+        week: study.week,
+        weekCount: study.weekCount + 1,
+        day: study.day,
+        dayCount: study.dayCount + 1,
+      }
+      await saveState(dir, st)
+    } catch {
+      // 定时器里不抛
+    } finally {
+      studyBusy = false
+    }
+  }
+
+  ctx.effect(() => {
+    studyTimer = setInterval(() => void studyTick(), 60000)
+    studyTimer.unref?.()
+    const kick = setTimeout(() => void studyTick(), 15000)
+    kick.unref?.()
+    return () => {
+      studyDisposed = true
+      if (studyTimer) clearInterval(studyTimer)
+      clearTimeout(kick)
+    }
+  })
+
   const stateOf = async () => {
     const { dir, perDay } = await config()
     await ensureDir(dir)
@@ -580,25 +826,51 @@ export function apply(ctx) {
       async handler(req, res) {
         const { dir, perDay, st, shelf, readToday: rt } = await stateOf()
         const cfgNow = await config()
-        const books = shelf.map((b) => {
+        const books = []
+        for (const b of shelf) {
           const rec = st.books[b.id] || {}
-          return {
+          let chapters = rec.chapters || 0
+          if (!chapters) {
+            try {
+              const toc = await readTocOnly(dir, b.id)
+              chapters = (toc && toc.chapters && toc.chapters.length) || 0
+            } catch {}
+          }
+          books.push({
             id: b.id,
             title: rec.title || b.id,
             size: b.size,
             mtime: b.mtime,
-            chapters: rec.chapters || 0,
+            chapters,
             readThrough: rec.readThrough || 0,
             next: rec.next || 1,
             lastReadAt: rec.lastReadAt || '',
             current: st.current === b.id,
             status: bookStatusOf(cfgNow, b.id),
-          }
-        })
+          })
+        }
         let notes = ''
         try { notes = await readFile(await notesPath(dir), 'utf8') } catch {}
         res.setHeader('content-type', 'application/json; charset=utf-8')
-        res.end(JSON.stringify({ ok: true, dir, perDay, today: today(), readToday: rt, current: st.current, books, notes, noteSort: Number(cfgNow.noteSort) || 0 }))
+        const st2 = studyStateOf(st, Date.now())
+        const liveSessions = await liveSessionList()
+        res.end(JSON.stringify({
+          ok: true, dir, perDay, today: today(), readToday: rt, current: st.current, books, notes,
+          noteSort: Number(cfgNow.noteSort) || 0,
+          study: {
+            enabled: cfgNow.studyEnabled === true,
+            from: cfgNow.studyFrom || '',
+            to: cfgNow.studyTo || '',
+            mode: studyModeOf(cfgNow),
+            perWeek: studyPerWeekOf(cfgNow),
+            perDay: studyPerDayOf(cfgNow),
+            lastAt: st2.lastAt,
+            weekCount: st2.weekCount,
+            dayCount: st2.dayCount,
+            session: cfgNow.studySession || '',
+            sessions: liveSessions,
+          },
+        }))
       },
     }),
   )
@@ -1213,6 +1485,18 @@ async function signWork(rel, who) {
       output: textOut,
       async execute() {
         const { dir, perDay, st, shelf, readToday: rt, today: t } = await stateOf()
+        const books = []
+        for (const b of shelf) {
+          const r = st.books[b.id] || {}
+          let chapters = r.chapters || 0
+          if (!chapters) {
+            try {
+              const toc = await readTocOnly(dir, b.id)
+              chapters = (toc && toc.chapters && toc.chapters.length) || 0
+            } catch {}
+          }
+          books.push({ id: b.id, chapters, readThrough: r.readThrough || 0, next: r.next || 1, lastReadAt: r.lastReadAt || '' })
+        }
         return {
           dir,
           today: t,
@@ -1220,10 +1504,7 @@ async function signWork(rel, who) {
           readToday: rt,
           left: Math.max(0, perDay - rt),
           current: st.current,
-          books: shelf.map((b) => {
-            const r = st.books[b.id] || {}
-            return { id: b.id, chapters: r.chapters || 0, readThrough: r.readThrough || 0, next: r.next || 1, lastReadAt: r.lastReadAt || '' }
-          }),
+          books,
         }
       },
     }),

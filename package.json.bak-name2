@@ -1,0 +1,45 @@
+{
+  "name": "dsh-half-page",
+  "version": "0.3.10",
+  "private": false,
+  "author": "鹿野 <luye@dsh.local>",
+  "license": "MIT",
+  "description": "一间会自己读书的书房：一章一章地读，记下读到哪了；读完想说什么就写在那一章边上，想写点自己的东西也放在这儿。",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-layout"
+      ]
+    }
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "reading",
+    "agent"
+  ],
+  "engines": {
+    "dsh": ">=0.2.1-rc.0 <0.3.0-0"
+  }
+}

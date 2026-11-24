@@ -35,6 +35,15 @@ window.__ModuleLoader__.load({
     }
 
     const fmt = (n) => n >= 1048576 ? (n / 1048576).toFixed(1) + 'M' : n >= 1024 ? Math.round(n / 1024) + 'K' : String(n)
+
+    function studyLine(s) {
+      if (!s) return ''
+      const last = s.lastAt ? new Date(s.lastAt).toLocaleString('zh-CN', { hour12: false }) : '还没有'
+      const byDay = s.mode === 'day'
+      const used = byDay ? (s.dayCount || 0) : (s.weekCount || 0)
+      const cap = byDay ? (s.perDay || 1) : (s.perWeek || 3)
+      return '上次提醒：' + last + ' · ' + (byDay ? '今天' : '本周') + '已叫 ' + used + '/' + cap + ' 次'
+    }
     const copy = (t) => { try { navigator.clipboard.writeText(t) } catch {} }
 
     async function getJson(url, opt) {
@@ -472,6 +481,57 @@ window.__ModuleLoader__.load({
             h('input', { style: { ...S.input, width: 64 }, defaultValue: (cfg && cfg.quietTo) || '', placeholder: '08:00', onBlur: (e) => saveCfg({ quietTo: e.target.value }) }),
             h('div', { style: S.dim }, '拦 reading_next，手动读需传 force: true'),
           ),
+          h('div', { style: { ...S.row, marginBottom: 6, marginTop: 10, paddingTop: 10, borderTop: '1px solid ' + C.line } },
+            h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+              h('input', {
+                type: 'checkbox',
+                defaultChecked: !!(cfg && cfg.studyEnabled),
+                onChange: (e) => saveCfg({ studyEnabled: e.target.checked }),
+              }),
+              h('span', null, '书房时间'),
+            ),
+            h('input', { style: { ...S.input, width: 64 }, defaultValue: (cfg && cfg.studyFrom) || '', placeholder: '例 22:00', onBlur: (e) => saveCfg({ studyFrom: e.target.value }) }),
+            h('div', { style: S.dim }, '至'),
+            h('input', { style: { ...S.input, width: 64 }, defaultValue: (cfg && cfg.studyTo) || '', placeholder: '例 23:00', onBlur: (e) => saveCfg({ studyTo: e.target.value }) }),
+            h('button', {
+              style: S.btn,
+              title: '点一下在「每周 / 每天」之间切换',
+              onClick: () => saveCfg({ studyMode: ((cfg && cfg.studyMode) === 'day' ? 'week' : 'day') }),
+            }, ((cfg && cfg.studyMode) === 'day') ? '每天' : '每周'),
+            h('input', {
+              key: 'study-per-' + (((cfg && cfg.studyMode) === 'day') ? 'day' : 'week'),
+              style: { ...S.input, width: 56 },
+              type: 'number', min: 1, max: 7,
+              defaultValue: ((cfg && cfg.studyMode) === 'day')
+                ? ((cfg && cfg.studyPerDay) || 1)
+                : ((cfg && cfg.studyPerWeek) || 3),
+              onBlur: (e) => {
+                const v = Math.min(7, Math.max(1, Number(e.target.value) || 1))
+                saveCfg(((cfg && cfg.studyMode) === 'day') ? { studyPerDay: v } : { studyPerWeek: v })
+              },
+            }),
+            h('div', { style: S.dim }, '次'),
+          ),
+          h('div', { style: S.row },
+            h('div', { style: S.dim }, '在'),
+            h('select', {
+              style: { ...S.input, width: 170 },
+              defaultValue: (cfg && cfg.studySession) || '',
+              onChange: (e) => saveCfg({ studySession: e.target.value }),
+            },
+              h('option', { key: '', value: '' }, '最近活跃的会话'),
+              ((state && state.study && state.study.sessions) || [])
+                .map((s) => h('option', { key: s.id, value: s.id }, s.title || ('会话 ' + String(s.id).slice(-8)))),
+              ((cfg && cfg.studySession)
+                && !((state && state.study && state.study.sessions) || []).some((s) => s.id === cfg.studySession))
+                ? h('option', { key: 'cur', value: cfg.studySession }, '已选（这条会话现在没开着）')
+                : null,
+            ),
+            h('div', { style: S.dim }, '里叫'),
+          ),
+          h('div', { style: { ...S.dim, marginBottom: 6 } }, '到点只在上面那条会话里说一句，读不读由它自己决定；默认关闭'),
+          h('div', { style: { ...S.dim, marginBottom: 6 } }, '同时装着「鱼的心跳」的话，建议这条别勾——两边各叫各的，不会互相避让'),
+          h('div', { style: S.dim }, studyLine(state && state.study)),
         ),
         h('div', { style: S.card },
           h('div', { style: { fontWeight: 600, marginBottom: 8 } }, '导入一本书'),
