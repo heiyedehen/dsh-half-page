@@ -1,9 +1,14 @@
 {
   "name": "dsh-half-page",
-  "version": "0.3.51",
+  "version": "0.3.52",
   "private": false,
   "author": "鹿野 <luye@dsh.local>",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/heiyedehen/dsh-half-page.git"
+  },
+  "homepage": "https://github.com/heiyedehen/dsh-half-page",
   "description": "一间会自己读书的书房：一章一章地读，记下读到哪了；读完想说什么就写在那一章边上，想写点自己的东西也放在这儿。",
   "type": "module",
   "exports": {
@@ -44,6 +49,6 @@
     "agent"
   ],
   "engines": {
-    "dsh": ">=0.2.1-rc.0 <0.4.0-0"
+    "dsh": ">=0.2.3-alpha.0 <0.4.0-0"
   }
 }

@@ -8,6 +8,41 @@ import { fileURLToPath } from 'node:url'
 import { readTimeline, newestSessionId } from './lib/session-probe.js'
 import { loadCreateUserMessage, SOURCE_KIND } from './lib/notice.js'
 
+/**
+ * 路由准入（工单-HTTP路由准入，2026-11-26）。
+ *
+ * 宿主契约：register({ auth }) 的 auth 可以是
+ * 'anonymous' | 'required' | 'deny'，或 (request) => policy；
+ * request 里有 { headers, method, url, transport }。
+ *
+ * 规则：请求带 Origin/Referer 且跟 Host 对不上 → 拒；Origin 是 "null"
+ * （沙箱页面 / data: / file:）→ 拒；没带来源（curl、本地脚本、同源导航）
+ * 或来源就是本服务的 Host → 放行。面板在同源 iframe 里跑，功能不变。
+ */
+export function sameSiteAuth(request) {
+  const headers = request?.headers
+  const read = (name) => {
+    if (!headers) return undefined
+    if (typeof headers.get === 'function') return headers.get(name) ?? undefined
+    const value = headers[name] ?? headers[name.toLowerCase()] ?? headers[name.toUpperCase()]
+    return Array.isArray(value) ? value[0] : value
+  }
+  const host = String(read('host') || '')
+  const source = String(read('origin') || read('referer') || '')
+  if (!source) return 'anonymous'
+  if (source === 'null') return 'deny'
+  try {
+    const url = new URL(source)
+    if (host && url.host === host) return 'anonymous'
+    // 同一个本机服务、但 Host 头缺失（HTTP/1.0、某些本地代理）
+    if (!host && (url.hostname === '127.0.0.1' || url.hostname === 'localhost')) return 'anonymous'
+    return 'deny'
+  } catch {
+    return 'deny'
+  }
+}
+
+
 export const inject = ['webServer', 'tools', 'systemPrompt', 'agents', 'sessions']
 
 const HOME = process.env.USERPROFILE || process.env.HOME || homedir()
@@ -821,6 +856,7 @@ export function apply(ctx, rawConfig) {
   // 面板读取
   ctx.effect(() =>
     ctx.webServer.register({
+      auth: sameSiteAuth,
       kind: 'exact',
       path: '/dsh-reading.state',
       async handler(req, res) {
@@ -878,6 +914,7 @@ export function apply(ctx, rawConfig) {
   // 把某本设为「正在读」
   ctx.effect(() =>
     ctx.webServer.register({
+      auth: sameSiteAuth,
       kind: 'exact',
       path: '/dsh-reading.setCurrent',
       async handler(req, res) {
@@ -894,6 +931,7 @@ export function apply(ctx, rawConfig) {
   // 面板里直接读一章（不记账）
   ctx.effect(() =>
     ctx.webServer.register({
+      auth: sameSiteAuth,
       kind: 'exact',
       path: '/dsh-reading.chapter',
       async handler(req, res) {
@@ -920,6 +958,7 @@ export function apply(ctx, rawConfig) {
   // 面板里点「下一章」：记一次已读并推进
   ctx.effect(() =>
     ctx.webServer.register({
+      auth: sameSiteAuth,
       kind: 'exact',
       path: '/dsh-reading.advance',
       async handler(req, res) {
@@ -947,6 +986,7 @@ export function apply(ctx, rawConfig) {
   // 面板里点「退一章」：退回上一章（手滑多点了一下能救回来）
   ctx.effect(() =>
     ctx.webServer.register({
+      auth: sameSiteAuth,
       kind: 'exact',
       path: '/dsh-reading.back',
       async handler(req, res) {
@@ -1025,6 +1065,7 @@ async function signWork(rel, who) {
 
   ctx.effect(() =>
     ctx.webServer.register({
+      auth: sameSiteAuth,
       kind: 'exact',
       path: '/dsh-reading.works',
       async handler(req, res) {
@@ -1067,6 +1108,7 @@ async function signWork(rel, who) {
   // 给面板读一张图（限制在上面那几个根里）
   ctx.effect(() =>
     ctx.webServer.register({
+      auth: sameSiteAuth,
       kind: 'exact',
       path: '/dsh-reading.image',
       async handler(req, res) {
@@ -1095,6 +1137,7 @@ async function signWork(rel, who) {
   // 给一件作品署名
   ctx.effect(() =>
     ctx.webServer.register({
+      auth: sameSiteAuth,
       kind: 'exact',
       path: '/dsh-reading.sign',
       async handler(req, res) {
@@ -1120,6 +1163,7 @@ async function signWork(rel, who) {
   // 取一个文本文件的正文（作品 / 读后感），供面板展示与复制
   ctx.effect(() =>
     ctx.webServer.register({
+      auth: sameSiteAuth,
       kind: 'exact',
       path: '/dsh-reading.file',
       async handler(req, res) {
@@ -1145,6 +1189,7 @@ async function signWork(rel, who) {
   // 设置读写：perDay / notesEvery / quietFrom-quietTo / writing / favorites
   ctx.effect(() =>
     ctx.webServer.register({
+      auth: sameSiteAuth,
       kind: 'exact',
       path: '/dsh-reading.config',
       async handler(req, res) {
@@ -1171,6 +1216,7 @@ async function signWork(rel, who) {
   // 面板里导入一本书（txt/md）：body {path}
   ctx.effect(() =>
     ctx.webServer.register({
+      auth: sameSiteAuth,
       kind: 'exact',
       path: '/dsh-reading.importText',
       async handler(req, res) {
@@ -1194,6 +1240,7 @@ async function signWork(rel, who) {
 
   ctx.effect(() =>
     ctx.webServer.register({
+      auth: sameSiteAuth,
       path: '/dsh-reading.import',
       async handler(req, res) {
         res.setHeader('content-type', 'application/json; charset=utf-8')
@@ -1239,6 +1286,7 @@ async function signWork(rel, who) {
   // 近况：一句状态 + 最近 7 天的读书/动笔时间线（只报事实，不编状态数值）
   ctx.effect(() =>
     ctx.webServer.register({
+      auth: sameSiteAuth,
       kind: 'exact',
       path: '/dsh-reading.recent',
       async handler(req, res) {
@@ -1314,6 +1362,7 @@ async function signWork(rel, who) {
   // 下架一本书：文件移到 books/.trash（可手工找回），state 记录清掉；读后感一律不动
   ctx.effect(() =>
     ctx.webServer.register({
+      auth: sameSiteAuth,
       kind: 'exact',
       path: '/dsh-reading.removeBook',
       async handler(req, res) {
@@ -1360,6 +1409,7 @@ async function signWork(rel, who) {
   // 稿子状态：在写 / 写完了 / 搁下了（存在 reading.config.json 的 workStatus 里）
   ctx.effect(() =>
     ctx.webServer.register({
+      auth: sameSiteAuth,
       kind: 'exact',
       path: '/dsh-reading.workstatus',
       async handler(req, res) {
@@ -1388,6 +1438,7 @@ async function signWork(rel, who) {
   // 读后感的排序方式（0=章节升 1=章节降 2=时间降），存在 reading.config.json 里
   ctx.effect(() =>
     ctx.webServer.register({
+      auth: sameSiteAuth,
       kind: 'exact',
       path: '/dsh-reading.notesort',
       async handler(req, res) {
@@ -1407,6 +1458,7 @@ async function signWork(rel, who) {
   // 书籍状态：在读 / 已读完 / 弃坑（空 status 表示清掉）
   ctx.effect(() =>
     ctx.webServer.register({
+      auth: sameSiteAuth,
       kind: 'exact',
       path: '/dsh-reading.bookstatus',
       async handler(req, res) {
