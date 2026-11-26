@@ -46,8 +46,10 @@ export function sameSiteAuth(request) {
 export const inject = ['webServer', 'tools', 'systemPrompt', 'agents', 'sessions']
 
 const HOME = process.env.USERPROFILE || process.env.HOME || homedir()
-const CONFIG = join(HOME, '.dsh', 'reading.config.json')
-const DEFAULT_DIR = join(HOME, '.dsh', 'reading')
+// 跟宿主的 DSH_HOME 走：有人把它设到别的盘时，数据和插件不能分家（心跳就是这么写的）
+const DSH_HOME = process.env.DSH_HOME || join(HOME, '.dsh')
+const CONFIG = join(DSH_HOME, 'reading.config.json')
+const DEFAULT_DIR = join(DSH_HOME, 'reading')
 
 const CH_RE = /^[ \t\u3000]*(第[0-9０-９一二三四五六七八九十百千两零〇]+[章节回][^\n]{0,30})$/m
 const CH_LINE_RE = /^[ \t\u3000]*(第[0-9０-９一二三四五六七八九十百千两零〇]+[章节回][^\n]{0,30})$/gm
