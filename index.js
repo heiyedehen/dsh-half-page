@@ -2469,8 +2469,9 @@ async function signWork(rel, who) {
       parameters: obj(),
       output: textOut,
       async execute(args, exec) {
-        const { dir, perDay, st, shelf, readToday: rt, today: t } = await stateOf()
+        const { dir, perDay, st, shelf, today: t } = await stateOf()
         const reader = await readerOf(exec)
+        const rt = readTodayOf(st, reader.id)
         const books = []
         for (const b of shelf) {
           const r = st.books[b.id] || {}
@@ -2526,8 +2527,9 @@ async function signWork(rel, who) {
           const q = inQuietNow(await config())
           if (q) throw new Error(`静音时段（${q.fromText}–${q.toText}），不自动读。真要读请传 force: true`)
         }
-        const { dir, perDay, st, readToday: rt } = await stateOf()
+        const { dir, perDay, st } = await stateOf()
         const reader = await readerOf(exec)
+        const rt = readTodayOf(st, reader.id)
         // 取书口径跟 reading_note 一致：明说 > 我自己刚读的那本 > 全局当前那本
         const id = args?.book || lastReadBookOf(st, reader.id)
         if (!id) throw new Error('不知道读哪本：传 book，或先读过一本')
