@@ -41,10 +41,8 @@ window.__ModuleLoader__.load({
     function studyLine(s) {
       if (!s) return ''
       const last = s.lastAt ? new Date(s.lastAt).toLocaleString('zh-CN', { hour12: false }) : '还没有'
-      const byDay = s.mode === 'day'
-      const used = byDay ? (s.dayCount || 0) : (s.weekCount || 0)
-      const cap = byDay ? (s.perDay || 1) : (s.perWeek || 3)
-      return '上次提醒：' + last + ' · ' + (byDay ? '今天' : '本周') + '已叫 ' + used + '/' + cap + ' 次'
+      const used = (s.dayCount || 0)
+      return '上次提醒：' + last + ' · 今天已叫 ' + used + ' 次'
     }
     const copy = (t) => { try { navigator.clipboard.writeText(t) } catch {} }
 
