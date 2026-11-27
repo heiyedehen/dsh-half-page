@@ -9,6 +9,8 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const h = React.createElement
     const { useState, useEffect, useMemo } = React
+    // 书名自带《》时别再套一层
+    const showTitle = (t) => { const s = String(t || ''); return /^《/.test(s) ? s : '《' + s + '》' }
 
     // 浅色主题，跟 DSH 主界面一致（深底浅字会和白界面不和谐）
     const C = {
@@ -46,6 +48,76 @@ window.__ModuleLoader__.load({
     }
     const copy = (t) => { try { navigator.clipboard.writeText(t) } catch {} }
 
+    // 面板在 iframe 里，浏览器不让直接下载/选文件；备份交给宿主写盘，恢复给一个路径让宿主读
+    // 备份：由宿主弹「另存为」，用户自己选位置
+    async function backupAll() {
+      setBusy(true)
+      setMsg('正在打包…', 'bak')
+      try {
+        const r = await getJson('/dsh-reading.backupFile', { method: 'POST' })
+        if (r && r.ok) {
+          setLastBackup(r.path)
+          setMsg('已备份到 ' + r.path, 'bak')
+          try {
+            await getJson('/dsh-reading.reveal', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ path: r.path }),
+            })
+          } catch {}
+        } else setMsg('备份失败：' + ((r && r.error) || '未知'), 'bak')
+      } catch (e) {
+        setMsg('备份失败：' + String(e), 'bak')
+      } finally { setBusy(false) }
+    }
+    async function reveal(p) {
+      try {
+        const r = await getJson('/dsh-reading.reveal', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: p }) })
+        if (!r || !r.ok) setMsg('打不开文件夹：' + ((r && r.error) || '未知'), 'bak')
+      } catch (e) { setMsg('打不开文件夹：' + String((e && e.message) || e), 'bak') }
+    }
+
+    async function checkUpd() {
+      setBusy(true)
+      try {
+        const r = await getJson('/dsh-reading.update')
+        if (r && r.ok) {
+          const d = new Date()
+          const pad = (n) => String(n).padStart(2, '0')
+          setUpd({ ...r, at: pad(d.getHours()) + ':' + pad(d.getMinutes()) })
+          setMsg(r.outdated ? ('发现新版本 ' + r.latest + '：可以点「复制更新命令」，在终端里跑') : (r.latest ? ('已是最新版 ' + r.current + '，不用更新') : '查不到 npm（可能离线），稍后再试'), 'upd')
+        } else setMsg('检测失败：' + ((r && r.error) || '未知'), 'upd')
+      } catch (e) { setMsg('检测失败：' + String((e && e.message) || e), 'upd') } finally { setBusy(false) }
+    }
+
+    // 恢复：由宿主弹「打开」，选完直接恢复
+    async function restoreFromPath() {
+      setBusy(true)
+      setMsg('正在读取备份…', 'bak')
+      try {
+        let path = (restorePath || '').trim()
+        if (!path) {
+          const pick = await getJson('/dsh-reading.pickFile', { method: 'POST' })
+          if (!pick || !pick.ok) {
+            setMsg((pick && pick.cancelled) ? '取消了，没恢复' : ('没选到文件：' + ((pick && pick.error) || '窗口没起来，可以直接把路径填在下面')), 'bak')
+            return
+          }
+          path = pick.path
+          setRestorePath(path)
+        }
+        const f = await getJson('/dsh-reading.readFile?path=' + encodeURIComponent(path))
+        if (!f || !f.ok) { setMsg('读不到那个文件：' + ((f && f.error) || '未知'), 'bak'); return }
+        const r = await getJson('/dsh-reading.restore', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ json: f.text }),
+        })
+        if (r && r.ok) { setMsg('已恢复：' + (r.books || 0) + ' 本 · ' + (r.chapters || 0) + ' 段读后感', 'bak'); await load() }
+        else setMsg('恢复失败：' + ((r && r.error) || '未知'), 'bak')
+      } catch (e) {
+        setMsg('恢复失败：' + String(e), 'bak')
+      } finally { setBusy(false) }
+    }
     async function getJson(url, opt) {
       const r = await fetch(url, opt)
       return r.json()
@@ -112,17 +184,30 @@ window.__ModuleLoader__.load({
   function Panel() {
       const [state, setState] = useState(null)
       const [confirmId, setConfirmId] = useState('')
+      const [pendingAdopt, setPendingAdopt] = useState('')
       const [tab, setTab] = useState('read')
       const [raw, setRaw] = useState('')
       const [showRaw, setShowRaw] = useState(false)
       const [works, setWorks] = useState(null)
       const [opened, setOpened] = useState(null)
       const [cfg, setCfg] = useState(null)
-      const [msg, setMsg] = useState('')
+      const [msg, setMsgRaw] = useState('')
+      const [msgAt, setMsgAt] = useState('')
+      const [restorePath, setRestorePath] = useState('')
+      const [lastBackup, setLastBackup] = useState('')
+      const [upd, setUpd] = useState(null)
+      const setMsg = (text, at = '') => { setMsgRaw(text); setMsgAt(at || '') }
       const [busy, setBusy] = useState(false)
       const [recent, setRecent] = useState(null)
       const [noteView, setNoteView] = useState({})
       const [bookAct, setBookAct] = useState(0)
+      const [shownBook, setShownBook] = useState('')
+      const [picking, setPicking] = useState(false)
+      const [picked, setPicked] = useState([])
+      // 读者：'' = 还没选；'__legacy__' = 总进度（全机），其余是会话 id
+      const TOTAL_READER = '__legacy__'
+      const [readerId, setReaderId] = useState('')
+      const [authorFilter, setAuthorFilter] = useState('')
       // 大图查看器：面板跑在 iframe 里，window.open 会被拦，所以自己在面板内弹一层
       const [viewer, setViewer] = useState(null)
       useEffect(() => {
@@ -134,42 +219,59 @@ window.__ModuleLoader__.load({
       const NOTE_PAGE = 10
       let importPath = ''
 
-      const load = async () => {
+      const load = async (rid) => {
         try {
-          const st = await getJson('/dsh-reading.state')
+          const st = await getJson('/dsh-reading.state' + (rid ? '?reader=' + encodeURIComponent(rid) : ''))
           setState(st)
           if (st && st.notes) setRaw(st.notes)
           const c = await getJson('/dsh-reading.config')
           if (c && c.ok) setCfg(c.config || {})
-          const rc = await getJson('/dsh-reading.recent')
-          if (rc && rc.ok) setRecent(rc)
         } catch (e) { setMsg('读不到状态：' + String(e && e.message || e)) }
       }
-      useEffect(() => { load() }, [])
+      useEffect(() => { load(); fetch('/dsh-reading.update').then((r) => r.json()).then((r) => { if (r && r.ok) setUpd(r) }).catch(() => {}) }, [])
 
       const notes = useMemo(() => parseNotes(raw), [raw])
-      const cur = state && state.books && state.books.find((b) => b.id === state.current)
+      // 打开面板默认显示「最近读过的那本」；手点书名只在本页临时切换（不写盘、不动进度）
+      const recentId = (state && state.books && state.books.filter((b) => b.lastReadAt).sort((a, b) => String(b.lastReadAt).localeCompare(String(a.lastReadAt)))[0] || {}).id || ''
+      const shownId = shownBook || recentId || (state && state.current) || ''
+      const cur = state && state.books && state.books.find((b) => b.id === shownId)
       const favs = (cfg && cfg.favorites) || []
+      const readers = (state && state.readers) || []
+      // 下拉里只列真读者；「总进度」是下拉旁边那个按钮，不占选项
+      const realReaders = readers.filter((r) => r.id !== TOTAL_READER)
+      // 默认跟着「最近读过的那位读者」；要点总进度才切过去
+      const recentReader = realReaders.slice().sort((a, b) => (Number(b.lastAt) || 0) - (Number(a.lastAt) || 0))[0]
+      const activeRid = readerId || (recentReader && recentReader.id) || TOTAL_READER
+      const isTotal = activeRid === TOTAL_READER
+      // 读者换了就按那位读者重拉一次：书级的「我读到第几章 / 那章叫什么」是按读者算的
+      useEffect(() => { if (activeRid) load(activeRid === TOTAL_READER ? '__legacy__' : activeRid) }, [activeRid])
+      const me = readers.find((r) => r.id === activeRid) || null
 
-      const advance = async () => {
-        if (busy) return
-        setBusy(true)
-        try {
-          const r = await getJson('/dsh-reading.advance', { method: 'POST' })
-          if (r && r.ok) { setMsg('推进到第 ' + r.chapter + ' 章'); await load() }
-          else setMsg('没推进：' + (r && r.error || '未知'))
-        } finally { setBusy(false) }
-      }
+      // 近况跟着当前读者走：切读者就重拉一次（服务端只报这位读者翻过的）
+      useEffect(() => {
+        let alive = true
+        ;(async () => {
+          try {
+            const rc = await getJson('/dsh-reading.recent?reader=' + encodeURIComponent(activeRid))
+            if (alive && rc && rc.ok) setRecent(rc)
+          } catch {}
+        })()
+        return () => { alive = false }
+      }, [activeRid, state])
 
-      const backOne = async () => {
-        if (busy) return
-        setBusy(true)
-        try {
-          const r = await getJson('/dsh-reading.back', { method: 'POST' })
-          if (r && r.ok) { setMsg('退回第 ' + r.chapter + ' 章'); await load() }
-          else setMsg('没退：' + (r && r.error || '未知'))
-        } finally { setBusy(false) }
+      const mineOf = (bid) => {
+        if (isTotal) {
+          const b = state && state.books && state.books.find((x) => x.id === bid)
+          return b ? (Number(b.readThrough) || 0) : 0
+        }
+        const r = readers.find((x) => x.id === activeRid)
+        const b = r && r.books && r.books[bid]
+        return b ? (Number(b.readThrough) || 0) : 0
       }
+      const withReader = (p) => p + (p.indexOf('?') >= 0 ? '&' : '?') + 'reader=' + encodeURIComponent(activeRid)
+
+      // 进度只由鱼读书时写（reading_next / reading_mark）；面板不提供"推进/退回/从头读"按钮，
+      // 免得用户点一下就替某位读者记了一章。这里只保留 reading 的入口。
 
 
       const STATES = ['在写', '写完了', '搁下了']
@@ -180,18 +282,9 @@ window.__ModuleLoader__.load({
         await loadWorks()
       }
 
-      const BOOK_STATES = ['在读', '已读完', '弃坑']
       const removeBook = async (id) => {
         setConfirmId('')
         await getJson('/dsh-reading.removeBook', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }) })
-        const j = await getJson('/dsh-reading.state')
-        if (j && j.ok) setState(j)
-      }
-
-      const cycleBook = async (b) => {
-        const i = BOOK_STATES.indexOf(b.status || '')
-        const next = i < 0 ? BOOK_STATES[0] : (i === BOOK_STATES.length - 1 ? '' : BOOK_STATES[i + 1])
-        await getJson('/dsh-reading.bookstatus', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: b.id, status: next }) })
         const j = await getJson('/dsh-reading.state')
         if (j && j.ok) setState(j)
       }
@@ -240,30 +333,102 @@ window.__ModuleLoader__.load({
         setOpened({ path: key, title: parts.join(' · '), text: ch ? ch.lines.join('\n') : '这条读后感已经不在了' })
       }
 
+      // 换「面板上正在显示的那本」，只改展示，不动任何人的阅读进度
+      const setCurrentBook = async (id) => {
+        const r = await getJson('/dsh-reading.setCurrent?id=' + encodeURIComponent(id))
+        if (r && r.ok) { await load(); setMsg('面板切到' + showTitle(id)) } else setMsg('切换失败')
+      }
+
+      const [slots, setSlots] = useState([])
+      useEffect(() => {
+        const s = (state && state.study && state.study.slots) || []
+        setSlots(s.map((x) => ({ ...x })))
+      }, [state])
+      // 整条列表一起存：新增/删/改时段都走这里
+      const saveSlots = async (next) => {
+        const body = { slots: (next || []).map((s) => ({ id: s.id, enabled: s.enabled === true, from: s.from, to: s.to, mode: s.mode, per: s.per, session: s.session })) }
+        const r = await fetch('/dsh-reading.study', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        }).then((x) => x.json()).catch(() => null)
+        if (r && r.ok) await load()
+        else setMsg('书房时间存不下：' + (r && r.error || '未知'), 'study')
+      }
+
       const saveCfg = async (patch) => {
         const r = await getJson('/dsh-reading.config', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch) })
-        if (r && r.ok) { setCfg(r.config); setMsg('已保存') ; await load() } else setMsg('保存失败：' + (r && r.error))
+        if (r && r.ok) { setCfg(r.config); setMsg('已保存', 'set') ; await load() } else setMsg('保存失败：' + (r && r.error), 'set')
       }
+
+      // 读书总进度：全机共用的那条书签——跟着当前这本书走，并标出是谁读到的
+      const furthestChip = (cur && cur.furthest > 0)
+        ? h('div', {
+            style: { fontSize: 11, padding: '1px 7px', borderRadius: 999, background: '#eef3fb', color: '#456', whiteSpace: 'nowrap' },
+            title: '这本书全机读到最远的地方（所有会话共用，只增不减）',
+          }, '最远：第 ' + cur.furthest + ' 章' + (cur.furthestReader ? (' · ' + cur.furthestReader.name) : ''))
+        : null
 
       const head = h('div', { style: S.card },
         h('div', { style: S.row },
-          h('div', { style: { fontWeight: 600, fontSize: 14 } }, cur ? ('正在读《' + cur.id + '》') : '还没导入书'),
-          h('div', { style: S.dim }, state ? ('今天 ' + state.readToday + '/' + state.perDay + ' 章') : ''),
+          h('div', { style: { fontWeight: 600, fontSize: 14 } }, cur
+            ? ((recentId && shownId && shownId !== recentId) ? ('当前显示' + showTitle(cur.id)) : (((recentReader && recentReader.name) ? (recentReader.name + ' ') : '') + '正在读' + showTitle(cur.id)))
+            : '还没导入书'),
+          furthestChip,
+
+          h('div', {
+            style: S.dim,
+            title: state ? ('今天已读 ' + (me && typeof me.today === 'number' ? me.today : state.readToday) + ' 章，上限 ' + state.perDay + ' 章') : '',
+          }, state ? ('今天还能读 ' + Math.max(0, state.perDay - (me && typeof me.today === 'number' ? me.today : state.readToday)) + ' 章') : ''),
           h('div', { style: { flex: 1 } }),
+          readers.length > 1
+            ? h('div', { style: S.row },
+                cur && Number(cur.furthest) > mineOf(cur.id)
+                ? h('button', {
+                    style: { ...S.btn, marginRight: 6, ...(pendingAdopt === cur.id ? { color: C.warn, borderColor: C.warn } : {}) },
+                    title: '把我在这一本书的书签接到全机读到最远的地方（只动我这份，不影响别人）；点一次变红，再点一次才生效',
+                    onClick: async () => {
+                      if (pendingAdopt !== cur.id) {
+                        setPendingAdopt(cur.id)
+                        window.setTimeout(() => setPendingAdopt((x) => (x === cur.id ? '' : x)), 4000)
+                        return
+                      }
+                      setPendingAdopt('')
+                      const r = await getJson('/dsh-reading.adopt?book=' + encodeURIComponent(cur.id) + (readerId ? '&reader=' + encodeURIComponent(readerId) : ''), { method: 'POST' })
+                      if (r && r.ok) { setMsg('已接到第 ' + r.readThrough + ' 章'); await load() }
+                      else setMsg('接不上：' + (r && r.error || '未知'))
+                    },
+                  }, pendingAdopt === cur.id ? ('再点一次，接到第 ' + cur.furthest + ' 章') : ('接到第 ' + cur.furthest + ' 章'))
+                : null,
+                h('div', { style: { ...S.dim, fontSize: 11 } }, '读者'),
+                h('select', {
+                  style: { fontSize: 12, padding: '2px 4px' },
+                  value: activeRid,
+                  onChange: (e) => { setReaderId(e.target.value); setBookAct(0) },
+                },
+                  realReaders.map((r) => h('option', { key: r.id, value: r.id }, r.name || r.id)),
+
+                ),
+              )
+            : null,
           h('button', { style: S.btn, onClick: load }, '刷新'),
         ),
         cur ? h('div', { style: { ...S.row, marginTop: 8 } },
-          h('div', { style: S.bar }, h('div', { style: { ...S.fill, width: Math.min(100, ((cur.readThrough || 0) / (cur.chapters || 1)) * 100) + '%' } })),
-          h('div', { style: S.dim }, '读到第 ' + (cur.readThrough || 0) + ' / ' + cur.chapters + ' 章'),
+          h('div', { style: S.bar }, h('div', { style: { ...S.fill, width: Math.min(100, ((mineOf(cur.id) || 0) / (cur.chapters || 1)) * 100) + '%' } })),
+          h('div', { style: S.dim },
+            (Number(mineOf(cur.id)) > 0
+              ? ('我读到第 ' + mineOf(cur.id) + ' 章，全书 ' + cur.chapters + ' 章')
+              : ('这本我还没读过，全书 ' + cur.chapters + ' 章'))
+            + (cur.furthest && cur.furthest > (mineOf(cur.id) || 0) ? ('（最远是第 ' + cur.furthest + ' 章）') : '')),
         ) : null,
       )
 
       const tabs = h('div', { style: S.row },
-        ['read', 'works', 'fav', 'set'].map((k) => h('div', {
+        ['read', 'note', 'works', 'fav', 'set'].map((k) => h('div', {
           key: k, style: S.tab(tab === k), onClick: () => { setTab(k); if ((k === 'works' || k === 'fav') && !works) loadWorks() },
-        }, k === 'read' ? '读书' : k === 'works' ? '她的作品' : k === 'fav' ? '收藏' : '设置')),
+        }, k === 'read' ? '读书' : k === 'note' ? '读后感' : k === 'works' ? '她的作品' : k === 'fav' ? '收藏' : '设置')),
         h('div', { style: { flex: 1 } }),
-        msg ? h('div', { style: { ...S.dim, color: C.ok } }, msg) : null,
+        (msg && !msgAt) ? h('div', { style: { ...S.dim, color: C.ok } }, msg) : null,
       )
 
       const readTab = h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
@@ -283,10 +448,22 @@ window.__ModuleLoader__.load({
                 h('div', { style: S.dim }, '这几天翻过的：'),
                 recent.days.map((d, i) => h('div', { key: i, style: S.row },
                   h('div', { style: S.dim }, d.day),
-                  h('div', { style: { flex: 1 } }, '《' + d.book + '》' + d.chapters + ' 章'),
+                  h('div', { style: { flex: 1 } }, showTitle(d.book) + d.chapters + ' 章'),
                 )),
               )
             : null,
+          recent && recent.perReader && recent.perReader.length
+            ? h('div', { style: { marginTop: 6 } },
+                isTotal
+                  ? h('div', { style: S.dim }, '这本谁读到哪（按读到最远排）：')
+                  : null,
+                recent.perReader.slice(0, 8).map((r, i) => h('div', { key: i, style: S.row },
+                  h('div', { style: { flex: 1 } }, showTitle(r.name)),
+                  h('div', { style: S.dim }, '读到第 ' + r.readThrough + (r.chapters ? (' / ' + r.chapters) : '') + ' 章'),
+                )),
+              )
+            : null,
+
           recent && recent.works && recent.works.length
             ? h('div', null,
                 h('div', { style: S.dim }, '最近碰过的稿子：'),
@@ -303,44 +480,87 @@ window.__ModuleLoader__.load({
 
         h('div', { style: S.card },
           h('div', { style: S.row },
-            h('div', { style: { fontWeight: 600 } }, '这一本'),
+            h('div', { style: { fontWeight: 600 } }, '读到哪'),
             h('div', { style: { flex: 1 } }),
-            h('button', { style: S.btn, onClick: backOne, disabled: busy }, busy ? '…' : '退一章'),
-            h('button', { style: S.btn, onClick: advance, disabled: busy }, busy ? '…' : '推进一章'),
+
+            // 只讲「鱼会说的话」；内部怎么选章（第一章还是接总进度）不上界面。
             h('button', { style: showRaw ? S.btnOn : S.btn, onClick: async () => {
               if (!showRaw && cur) {
-                const r = await getJson('/dsh-reading.chapter?book=' + encodeURIComponent(cur.id) + '&n=' + (cur.readThrough || 1))
+                const mineN = mineOf(cur.id)
+                if (!mineN) return
+                const r = await getJson('/dsh-reading.chapter?book=' + encodeURIComponent(cur.id) + '&n=' + mineN)
                 if (r && r.ok) setOpened({ path: 'chapter', text: r.text, title: r.title })
+                else setMsg('取不到原文：' + (r && r.error || '未知'))
               }
               setShowRaw(!showRaw)
             } }, showRaw ? '收起原文' : '显示原文'),
           ),
+          cur && Number(cur.mineReadThrough) > 0
+            ? h('div', { style: { ...S.dim, marginTop: 6 } },
+                '我读到第 ' + cur.mineReadThrough + ' 章'
+                + (cur.mineChapterTitle ? (' · ' + cur.mineChapterTitle) : ''))
+            : (cur
+                ? h('div', { style: { ...S.dim, marginTop: 6 } },
+                    (Number(cur.furthest) > 1 ? ('这本书别人读到第 ' + cur.furthest + ' 章了，我还没读过。') : '这本书我还没读过。'))
+                : null),
           showRaw && opened && opened.path === 'chapter'
             ? h('div', { style: { ...S.text, marginTop: 8 } }, (opened.title ? opened.title + '\n\n' : '') + opened.text)
             : null,
         ),
         h('div', { style: S.card },
-          h('div', { style: { fontWeight: 600, marginBottom: 6 } }, '书架'),
+          h('div', { style: { ...S.row, marginBottom: 6 } },
+            h('div', { style: { fontWeight: 600 } }, '书架'),
+            h('div', { style: { ...S.dim, marginLeft: 8 } }, '点书名，看各人的进度'),
+            h('div', { style: { flex: 1 } }),
+            picking && picked.length
+              ? h('button', {
+                  style: { ...S.btn, color: C.warn, borderColor: C.warn },
+                  onClick: async () => {
+                    for (const id of picked) await removeBook(id)
+                    setPicking(false); setPicked([]); setMsg('下架了 ' + picked.length + ' 本')
+                  },
+                }, '确认下架 ' + picked.length + ' 本')
+              : null,
+            h('button', {
+              style: picking ? S.btnOn : S.btn,
+              title: '批量从书架拿下来（文件移到 books/.trash，可手工找回；读后感不动）',
+              onClick: () => { setPicking(!picking); setPicked([]) },
+            }, picking ? '取消' : '下架'),
+          ),
           (state && state.books && state.books.length) ? state.books.map((b, i) => {
+            const mineNo = mineOf(b.id)
             const done = (b.readThrough || 0) >= (b.chapters || 1)
             return h('div', { key: i, style: S.row },
-              h('div', { style: { flex: 1, color: b.id === (state && state.current) ? C.accent : C.text } }, b.id),
-              h('div', { style: S.dim }, (b.readThrough || 0) + '/' + b.chapters),
-              h('button', {
+              picking
+                ? h('input', {
+                    type: 'checkbox',
+                    checked: picked.includes(b.id),
+                    onChange: (e) => setPicked(e.target.checked ? picked.concat([b.id]) : picked.filter((x) => x !== b.id)),
+                  })
+                : null,
+              // 点书名 = 把面板切到这本（只改显示，不动任何人的进度）；当前那本前面带个圆点
+              h('div', {
+                style: { flex: 1, cursor: 'pointer', color: b.id === shownId ? C.accent : C.text, fontWeight: b.id === shownId ? 600 : 400 },
+                title: b.id === shownId
+                  ? '面板顶部显示的就是这本（默认是最近读过的那本）'
+                  : '点书名把面板临时切到这本（只改显示，不动任何人的阅读进度）',
+                onClick: () => setShownBook(b.id),
+              }, (b.id === shownId ? '● ' : '') + b.id),
+              h('div', { style: S.dim },
+                (mineNo || 0) + '/' + b.chapters
+                + (b.furthest && b.furthest > mineNo ? ('（最远 ' + b.furthest + '）') : '')),
+              h('div', {
                 style: b.status === '弃坑' ? { ...S.tag, color: C.warn } : (done || b.status === '已读完' ? { ...S.tag, color: C.ok } : S.tag),
-                title: '点一下换状态：在读 → 已读完 → 弃坑 → 不标',
-                onClick: () => cycleBook(b),
-              }, b.status || (done ? '已读完' : '在读')),
-              h('button', {
-                style: { ...S.tag, color: confirmId === b.id ? C.warn : C.dim, marginLeft: 6 },
-                title: confirmId === b.id
-                  ? '再点一下就从书架拿下来（文件会移到 books/.trash，读后感不动）'
-                  : '从书架拿下来（文件移到 books/.trash，可手工找回；读后感不动）',
-                onClick: () => (confirmId === b.id ? removeBook(b.id) : setConfirmId(b.id)),
-              }, confirmId === b.id ? '确认？' : '下架'),
+                title: '这本书的状态由鱼自己写（reading_* 工具），面板只显示',
+              }, b.status || (done ? '已读完' : (mineNo ? '在读' : '未读'))),
+
             )
           }) : h('div', { style: S.dim }, '还没有书。'),
         ),
+      )
+
+      // 读后感单独一页：不和书架挤在一起
+      const noteTab = h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
         h('div', { style: S.card },
           notes.length ? (() => {
             const act = Math.min(bookAct, notes.length - 1)
@@ -358,7 +578,11 @@ window.__ModuleLoader__.load({
             if (sortMode === 1) sorted.sort((a, b) => (chapterNo(b.title) || -1) - (chapterNo(a.title) || -1))
             else if (sortMode === 2) sorted.sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')))
             else sorted.sort((a, b) => (chapterNo(a.title) || 1e9) - (chapterNo(b.title) || 1e9))
-            const list = all ? sorted : sorted.slice(page * NOTE_PAGE, page * NOTE_PAGE + NOTE_PAGE)
+            // 按署名筛：同一台机器上有好几个读者，读后记在一个文件里靠 by 分
+            const af = authorFilter
+            const authors = Array.from(new Set(notes.reduce((acc, n) => acc.concat(n.chapters.map((c) => c.by).filter(Boolean)), [])))
+            const seen = af ? sorted.filter((c) => (c.by || '') === af) : sorted
+            const list = all ? seen : seen.slice(page * NOTE_PAGE, page * NOTE_PAGE + NOTE_PAGE)
             const setView = (patch) => setNoteView(Object.assign({}, noteView, { [bi]: Object.assign({}, v, patch) }))
             const saveSort = (n) => { try { getJson('/dsh-reading.notesort', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sort: n }) }) } catch (e) {} }
             const paged = total > NOTE_PAGE
@@ -379,7 +603,17 @@ window.__ModuleLoader__.load({
                 paged ? h('button', { style: S.btn, disabled: all || page >= pages - 1, onClick: () => setView({ page: page + 1 }) }, '›') : null,
                 paged ? h('button', { style: all ? S.btnOn : S.btn, onClick: () => setView({ all: !all, page: 0 }) }, all ? '分页' : '全部') : null,
                 h('button', { style: S.btnOn, onClick: () => { const next = (sortMode + 1) % 3; setView({ sort: next, page: 0 }); saveSort(next) } }, sortLabels[sortMode]),
-                h('button', { style: S.btn, onClick: () => copy(bk.chapters.map((c) => '## ' + c.title + '\n' + c.lines.join('\n')).join('\n\n')) }, '复制这本'),
+                authors.length > 1
+                  ? h('select', {
+                      style: { fontSize: 12, padding: '2px 4px' },
+                      value: af,
+                      onChange: (e) => { setAuthorFilter(e.target.value); setView({ page: 0 }) },
+                    },
+                    h('option', { value: '' }, '全部署名'),
+                    authors.map((a) => h('option', { key: a, value: a }, a)),
+                  )
+                  : null,
+                h('button', { style: S.btn, onClick: () => copy(bk.chapters.map((c) => '## ' + c.title + '\n' + c.lines.join('\n')).join('\n\n')) }, '复制这本读后感'),
               ),
               (sortMode === 2 && bk.chapters.filter((c) => !c.at).length) ? h('div', { style: { ...S.dim, marginBottom: 6 } }, '有 ' + bk.chapters.filter((c) => !c.at).length + ' 段早期笔记当时没记时间，排在最后。') : null,
               list.map((c, ci) => h('div', { key: ci, style: { marginBottom: 6 } },
@@ -479,57 +713,82 @@ window.__ModuleLoader__.load({
             h('input', { style: { ...S.input, width: 64 }, defaultValue: (cfg && cfg.quietFrom) || '', placeholder: '03:00', onBlur: (e) => saveCfg({ quietFrom: e.target.value }) }),
             h('div', { style: S.dim }, '至'),
             h('input', { style: { ...S.input, width: 64 }, defaultValue: (cfg && cfg.quietTo) || '', placeholder: '08:00', onBlur: (e) => saveCfg({ quietTo: e.target.value }) }),
-            h('div', { style: S.dim }, '拦 reading_next，手动读需传 force: true'),
+            h('div', { style: S.dim }, '静音时段内不会自动读'),
           ),
+          msgAt === 'set' ? h('div', { style: { ...S.dim, color: C.ok, marginTop: 6 } }, msg) : null,
           h('div', { style: { ...S.row, marginBottom: 6, marginTop: 10, paddingTop: 10, borderTop: '1px solid ' + C.line } },
-            h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+            h('div', { style: { fontWeight: 600, marginRight: 10 } }, '书房时间'),
+            h('button', {
+              style: { ...S.btn, fontSize: 11, padding: '2px 8px' },
+              title: '可以有多条：不同时段、不同频率、叫进不同会话',
+              onClick: () => {
+                const next = slots.concat([{ id: 'slot-' + Date.now().toString(36), enabled: false, from: '22:00', to: '23:00', mode: 'day', per: 1, session: '' }])
+                setSlots(next); saveSlots(next)
+              },
+            }, '新增书房时间'),
+          ),
+          msgAt === 'study' ? h('div', { style: { ...S.dim, color: C.ok, marginTop: 4 } }, msg) : null,
+          (slots.length ? slots : []).map((s, i) =>
+            h('div', { key: s.id || i, style: { ...S.row, marginBottom: 6, flexWrap: 'wrap' } },
               h('input', {
                 type: 'checkbox',
-                defaultChecked: !!(cfg && cfg.studyEnabled),
-                onChange: (e) => saveCfg({ studyEnabled: e.target.checked }),
+                checked: s.enabled === true,
+                title: '这条开不开',
+                onChange: (e) => { const next = slots.slice(); next[i] = { ...s, enabled: e.target.checked }; setSlots(next); saveSlots(next) },
               }),
-              h('span', null, '书房时间'),
-            ),
-            h('input', { style: { ...S.input, width: 64 }, defaultValue: (cfg && cfg.studyFrom) || '', placeholder: '例 22:00', onBlur: (e) => saveCfg({ studyFrom: e.target.value }) }),
-            h('div', { style: S.dim }, '至'),
-            h('input', { style: { ...S.input, width: 64 }, defaultValue: (cfg && cfg.studyTo) || '', placeholder: '例 23:00', onBlur: (e) => saveCfg({ studyTo: e.target.value }) }),
-            h('button', {
-              style: S.btn,
-              title: '点一下在「每周 / 每天」之间切换',
-              onClick: () => saveCfg({ studyMode: ((cfg && cfg.studyMode) === 'day' ? 'week' : 'day') }),
-            }, ((cfg && cfg.studyMode) === 'day') ? '每天' : '每周'),
-            h('input', {
-              key: 'study-per-' + (((cfg && cfg.studyMode) === 'day') ? 'day' : 'week'),
-              style: { ...S.input, width: 56 },
-              type: 'number', min: 1, max: 7,
-              defaultValue: ((cfg && cfg.studyMode) === 'day')
-                ? ((cfg && cfg.studyPerDay) || 1)
-                : ((cfg && cfg.studyPerWeek) || 3),
-              onBlur: (e) => {
-                const v = Math.min(7, Math.max(1, Number(e.target.value) || 1))
-                saveCfg(((cfg && cfg.studyMode) === 'day') ? { studyPerDay: v } : { studyPerWeek: v })
+              h('input', {
+                style: { ...S.input, width: 64 },
+                value: s.from || '',
+                placeholder: '例 22:00',
+                onChange: (e) => { const next = slots.slice(); next[i] = { ...s, from: e.target.value }; setSlots(next) },
+                onBlur: () => saveSlots(slots),
+              }),
+              h('div', { style: S.dim }, '至'),
+              h('input', {
+                style: { ...S.input, width: 64 },
+                value: s.to || '',
+                placeholder: '例 23:00',
+                onChange: (e) => { const next = slots.slice(); next[i] = { ...s, to: e.target.value }; setSlots(next) },
+                onBlur: () => saveSlots(slots),
+              }),
+              h('button', {
+                style: S.btn,
+                title: '点一下在「每周 / 每天」之间切换',
+                onClick: () => {
+                  const next = slots.slice()
+                  const mode = s.mode === 'day' ? 'week' : 'day'
+                  next[i] = { ...s, mode, per: mode === 'day' ? 1 : 3 }
+                  setSlots(next); saveSlots(next)
+                },
+              }, s.mode === 'day' ? '每天' : '每周'),
+              h('input', {
+                style: { ...S.input, width: 56 },
+                type: 'number', min: 1, max: 7,
+                value: s.per || 1,
+                onChange: (e) => { const next = slots.slice(); next[i] = { ...s, per: Math.min(7, Math.max(1, Number(e.target.value) || 1)) }; setSlots(next) },
+                onBlur: () => saveSlots(slots),
+              }),
+              h('div', { style: S.dim }, '次'),
+              h('select', {
+                style: { ...S.input, width: 160 },
+                value: s.session || '',
+                onChange: (e) => { const next = slots.slice(); next[i] = { ...s, session: e.target.value }; setSlots(next); saveSlots(next) },
               },
-            }),
-            h('div', { style: S.dim }, '次'),
-          ),
-          h('div', { style: S.row },
-            h('div', { style: S.dim }, '在'),
-            h('select', {
-              style: { ...S.input, width: 170 },
-              defaultValue: (cfg && cfg.studySession) || '',
-              onChange: (e) => saveCfg({ studySession: e.target.value }),
-            },
-              h('option', { key: '', value: '' }, '最近活跃的会话'),
-              ((state && state.study && state.study.sessions) || [])
-                .map((s) => h('option', { key: s.id, value: s.id }, s.title || ('会话 ' + String(s.id).slice(-8)))),
-              ((cfg && cfg.studySession)
-                && !((state && state.study && state.study.sessions) || []).some((s) => s.id === cfg.studySession))
-                ? h('option', { key: 'cur', value: cfg.studySession }, '已选（这条会话现在没开着）')
-                : null,
+                h('option', { key: '', value: '' }, '最近活跃的会话'),
+                ((state && state.study && state.study.sessions) || [])
+                  .map((x) => h('option', { key: x.id, value: x.id }, x.title || ('会话 ' + String(x.id).slice(-8)))),
+                (s.session && !((state && state.study && state.study.sessions) || []).some((x) => x.id === s.session))
+                  ? h('option', { key: 'cur', value: s.session }, '已选（这条会话现在没开着）')
+                  : null,
+              ),
+              h('button', {
+                style: { ...S.btn, color: C.warn },
+                title: '删掉这一条（计数一起删）',
+                onClick: () => { const next = slots.filter((x, k) => k !== i); setSlots(next); saveSlots(next) },
+              }, '删'),
             ),
-            h('div', { style: S.dim }, '里叫'),
           ),
-          h('div', { style: { ...S.dim, marginBottom: 6 } }, '到点只在上面那条会话里说一句，读不读由它自己决定；默认关闭'),
+          h('div', { style: { ...S.dim, marginBottom: 6 } }, '到点只在选中的那条会话里说一句，读不读由它自己决定；默认关闭'),
           h('div', { style: { ...S.dim, marginBottom: 6 } }, '同时装着「鱼的心跳」的话，建议这条别勾——两边各叫各的，不会互相避让'),
           h('div', { style: S.dim }, studyLine(state && state.study)),
         ),
@@ -562,11 +821,11 @@ window.__ModuleLoader__.load({
                       bin += String.fromCharCode.apply(null, buf.subarray(i, i + CH))
                     }
                     const data = btoa(bin)
-                    setMsg('导入中…')
+                    setMsg('导入中…', 'imp')
                     const r = await fetch('/dsh-reading.importText', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: f.name, data }) })
                     const j = await r.json()
-                    if (!j.ok) { setMsg('失败：' + (j.error || '未知')); return }
-                    setMsg('已导入 ' + (j.id || '') + '（' + (j.chapters || 0) + ' 章）')
+                    if (!j.ok) { setMsg('失败：' + (j.error || '未知'), 'imp'); return }
+                    setMsg('已导入 ' + (j.id || '') + '（' + (j.chapters || 0) + ' 章）', 'imp')
                     await load()
                   } catch (err) { setMsg('失败：' + String(err)) }
                 }
@@ -586,19 +845,20 @@ window.__ModuleLoader__.load({
               style: S.btnOn,
               onClick: async () => {
                 const p = String(importPath || '').trim()
-                if (!p) { setMsg('先填文件路径'); return }
-                setMsg('导入中…')
+                if (!p) { setMsg('先填文件路径', 'imp'); return }
+                setMsg('导入中…', 'imp')
                 try {
                   const r = await fetch('/dsh-reading.import', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: p }) })
                   const j = await r.json()
-                  if (!j.ok) { setMsg('失败：' + (j.error || '未知')); return }
-                  setMsg('已导入 ' + (j.id || '') + '（' + (j.chapters || 0) + ' 章）')
+                  if (!j.ok) { setMsg('失败：' + (j.error || '未知'), 'imp'); return }
+                  setMsg('已导入 ' + (j.id || '') + '（' + (j.chapters || 0) + ' 章）', 'imp')
                   importPath = ''
                   await load()
-                } catch (e) { setMsg('失败：' + String(e)) }
+                } catch (e) { setMsg('失败：' + String(e), 'imp') }
               },
             }, '导入'),
           ),
+          msgAt === 'imp' ? h('div', { style: { ...S.dim, color: C.ok, marginTop: 4 } }, msg) : null,
           h('div', { style: S.dim }, '只认 .txt / .md，会复制到书架并统计章数。'),
         ),
         h('div', { style: S.card },
@@ -610,12 +870,75 @@ window.__ModuleLoader__.load({
           ),
         ),
         h('div', { style: S.card },
-          h('div', { style: { fontWeight: 600, marginBottom: 6 } }, '导出'),
+          h('div', { style: { fontWeight: 600, marginBottom: 6 } }, '备份 / 恢复'),
           h('div', { style: S.row },
-            h('button', { style: S.btn, onClick: () => { copy(raw); setMsg('读后感已复制') } }, '复制读后感全文'),
-            h('button', { style: S.btn, onClick: () => { copy(JSON.stringify(state, null, 2)); setMsg('进度已复制') } }, '复制阅读进度 JSON'),
+            h('button', { style: S.btn, onClick: async () => {
+              setBusy(true)
+              setMsg('正在打包…', 'bak')
+              try {
+                const r = await fetch('/dsh-reading.backupFile', { method: 'POST' }).then((x) => x.json())
+                if (r && r.ok) {
+                  setLastBackup(r.path)
+                  setMsg('已备份到 ' + r.path, 'bak')
+                  fetch('/dsh-reading.reveal', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: r.path }) }).catch(() => {})
+                } else setMsg('备份失败：' + ((r && r.error) || '未知'), 'bak')
+              } catch (e) {
+                setMsg('备份失败：' + String(e), 'bak')
+              } finally { setBusy(false) }
+            } }, '备份全部数据'),
+            h('button', { style: S.btn, onClick: () => { if (!lastBackup) { setMsg('先点一次备份', 'bak'); return } reveal(lastBackup) } }, '在文件夹里打开'),
           ),
-          h('div', { style: { ...S.dim, marginTop: 6 } }, cfg && cfg.favorites ? '' : ''),
+          h('div', { style: { ...S.row, marginTop: 6 } },
+            h('button', { style: S.btn, onClick: async () => {
+              setBusy(true)
+              setMsg('正在读取备份…', 'bak')
+              try {
+                let path = (restorePath || '').trim()
+                if (!path) {
+                  const pick = await fetch('/dsh-reading.pickFile', { method: 'POST' }).then((x) => x.json()).catch(() => null)
+                  if (pick && pick.ok && pick.path) { path = pick.path; setRestorePath(path) }
+                }
+                if (!path) { setMsg('先点「选择备份文件」，或把完整路径填在下面的框里', 'bak'); return }
+                const f = await fetch('/dsh-reading.readFile?path=' + encodeURIComponent(path)).then((x) => x.json())
+                if (!f || !f.ok) { setMsg('读不到那个文件：' + ((f && f.error) || '未知'), 'bak'); return }
+                const r = await fetch('/dsh-reading.restore', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ json: f.text }) }).then((x) => x.json())
+                if (r && r.ok) { setMsg('已恢复：' + (r.books || 0) + ' 本 · ' + (r.chapters || 0) + ' 段读后感', 'bak'); await load() }
+                else setMsg('恢复失败：' + ((r && r.error) || '未知'), 'bak')
+              } catch (e) {
+                setMsg('恢复失败：' + String(e), 'bak')
+              } finally { setBusy(false) }
+            } }, '恢复全部数据'),
+          ),          msgAt === 'bak' ? h('div', { style: { ...S.dim, color: C.ok, marginTop: 4 } }, msg) : null,
+          h('div', { style: { ...S.dim, marginTop: 6 } }, '备份 = 读后感全文 + 阅读进度，存成一个 .json 文件；恢复时在弹出的窗口里选那个文件。恢复前旧文件会存成 *bak-restore-*。'),
+          h('div', { style: { ...S.dim, marginTop: 4 } }, '单独想拿文字的话：' , h('span', { style: { cursor: 'pointer', textDecoration: 'underline' }, onClick: () => { copy(raw); setMsg('读后感全文已复制') } }, '复制读后感'), ' · ', h('span', { style: { cursor: 'pointer', textDecoration: 'underline' }, onClick: () => { copy(JSON.stringify(state, null, 2)); setMsg('进度 JSON 已复制') } }, '复制进度')),
+        ),
+        h('div', { style: S.card },
+          h('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 6 } },
+            h('div', { style: { fontWeight: 600 } }, '更新'),
+            h('div', { style: { ...S.dim, fontSize: 12 } }, 'v' + ((upd && upd.current) || (state && state.version) || '')),
+            (upd && upd.latest) ? h('div', { style: { fontSize: 12, color: upd.outdated ? C.warn : C.ok } }, 'npm 最新 ' + upd.latest) : null,
+          ),
+          h('div', { style: S.row },
+            h('button', { style: S.btn, onClick: async () => {
+              setBusy(true)
+              try {
+                const r = await fetch('/dsh-reading.update').then((x) => x.json())
+                if (r && r.ok) {
+                  const d = new Date()
+                  const pad = (n) => String(n).padStart(2, '0')
+                  setUpd({ ...r, at: pad(d.getHours()) + ':' + pad(d.getMinutes()) })
+                  setMsg(r.outdated
+                    ? ('发现新版本 ' + r.latest + '：可以点「复制更新命令」，在终端里跑')
+                    : (r.latest ? ('已是最新版 ' + r.current + '，不用更新') : '查不到 npm（可能离线），稍后再试'), 'upd')
+                } else setMsg('检测失败：' + ((r && r.error) || '未知'), 'upd')
+              } catch (e) {
+                setMsg('检测失败：' + String((e && e.message) || e), 'upd')
+              } finally { setBusy(false) }
+            } }, '检测更新'),
+            h('button', { style: S.btn, onClick: () => { copy('dsh plugin add dsh-half-page@latest'); setMsg('更新命令已复制', 'upd') } }, '复制更新命令'),
+          ),
+          msgAt === 'upd' ? h('div', { style: { ...S.dim, color: (upd && upd.outdated) ? C.warn : C.ok, marginTop: 4 } }, msg) : null,
+          h('div', { style: { ...S.dim, marginTop: 4 } }, '更新就是把 npm 上的最新版装一遍；命令可以复制出去，在终端里跑。'),
         ),
       )
 
@@ -665,7 +988,7 @@ window.__ModuleLoader__.load({
       return h('div', { style: S.wrap },
         head,
         tabs,
-        tab === 'read' ? readTab : tab === 'works' ? worksTab : tab === 'fav' ? favTab : setTabView,
+        tab === 'read' ? readTab : tab === 'note' ? noteTab : tab === 'works' ? worksTab : tab === 'fav' ? favTab : setTabView,
         viewerLayer,
       )
     }
