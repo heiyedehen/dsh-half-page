@@ -346,7 +346,7 @@ window.__ModuleLoader__.load({
       }, [state])
       // 整条列表一起存：新增/删/改时段都走这里
       const saveSlots = async (next) => {
-        const body = { slots: (next || []).map((s) => ({ id: s.id, enabled: s.enabled === true, from: s.from, to: s.to, mode: s.mode, per: s.per, session: s.session })) }
+        const body = { slots: (next || []).map((s) => ({ id: s.id, enabled: s.enabled === true, from: s.from, to: s.to, mode: s.mode, per: s.per, everyMinutes: s.everyMinutes, dailyBudget: s.dailyBudget, session: s.session })) }
         const r = await fetch('/dsh-reading.study', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
@@ -722,7 +722,7 @@ window.__ModuleLoader__.load({
               style: { ...S.btn, fontSize: 11, padding: '2px 8px' },
               title: '可以有多条：不同时段、不同频率、叫进不同会话',
               onClick: () => {
-                const next = slots.concat([{ id: 'slot-' + Date.now().toString(36), enabled: false, from: '22:00', to: '23:00', mode: 'day', per: 1, session: '' }])
+                const next = slots.concat([{ id: 'slot-' + Date.now().toString(36), enabled: false, from: '22:00', to: '23:00', everyMinutes: 30, dailyBudget: 2, session: '' }])
                 setSlots(next); saveSlots(next)
               },
             }, '新增书房时间'),
@@ -751,24 +751,25 @@ window.__ModuleLoader__.load({
                 onChange: (e) => { const next = slots.slice(); next[i] = { ...s, to: e.target.value }; setSlots(next) },
                 onBlur: () => saveSlots(slots),
               }),
-              h('button', {
-                style: S.btn,
-                title: '点一下在「每周 / 每天」之间切换',
-                onClick: () => {
-                  const next = slots.slice()
-                  const mode = s.mode === 'day' ? 'week' : 'day'
-                  next[i] = { ...s, mode, per: mode === 'day' ? 1 : 3 }
-                  setSlots(next); saveSlots(next)
-                },
-              }, s.mode === 'day' ? '每天' : '每周'),
+              h('div', { style: S.dim }, '这段时间内每'),
+              h('select', {
+                style: { ...S.input, width: 80 },
+                value: s.everyMinutes || 30,
+                title: '隔多久叫一次（最小间隔）',
+                onChange: (e) => { const next = slots.slice(); next[i] = { ...s, everyMinutes: Number(e.target.value) || 30 }; setSlots(next); saveSlots(next) },
+              },
+                [15, 30, 60, 120].map((m) => h('option', { key: m, value: m }, m + ' 分')),
+              ),
+              h('div', { style: S.dim }, '叫一次，最多'),
               h('input', {
                 style: { ...S.input, width: 56 },
-                type: 'number', min: 1, max: 7,
-                value: s.per || 1,
-                onChange: (e) => { const next = slots.slice(); next[i] = { ...s, per: Math.min(7, Math.max(1, Number(e.target.value) || 1)) }; setSlots(next) },
+                type: 'number', min: 1, max: 24,
+                value: s.dailyBudget || 2,
+                title: '这段里一天最多叫几次',
+                onChange: (e) => { const next = slots.slice(); next[i] = { ...s, dailyBudget: Math.min(24, Math.max(1, Number(e.target.value) || 1)) }; setSlots(next) },
                 onBlur: () => saveSlots(slots),
               }),
-              h('div', { style: S.dim }, '次'),
+              h('div', { style: S.dim }, '次/天'),
               h('select', {
                 style: { ...S.input, width: 160 },
                 value: s.session || '',

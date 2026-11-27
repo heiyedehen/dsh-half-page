@@ -450,11 +450,15 @@ export function normaliseStudySlot(raw, cfg, i = 0) {
   const s = raw || {}
   const mode = s.mode === 'day' || s.mode === 'week' ? s.mode : studyModeOf(cfg)
   const dBudget = Math.min(7, Math.max(1, Math.floor(Number(s.per) || (mode === 'day' ? studyPerDayOf(cfg) : studyPerWeekOf(cfg)))))
+  const every = Math.min(1440, Math.max(5, Math.floor(Number(s.everyMinutes) || 30)))
+  const budget = Math.min(24, Math.max(1, Math.floor(Number(s.dailyBudget) || dBudget || 4)))
   return {
     id: String(s.id || ('slot-' + (i + 1))),
     enabled: s.enabled === true,
     from: String(s.from ?? ''),
     to: String(s.to ?? ''),
+    everyMinutes: every,
+    dailyBudget: budget,
     mode,
     per: dBudget,
     session: String(s.session ?? ''),
@@ -490,6 +494,8 @@ export function slotCfgOf(slot) {
     studyMode: slot.mode,
     studyPerDay: slot.per,
     studyPerWeek: slot.per,
+    studyEveryMinutes: Math.min(1440, Math.max(5, Math.floor(Number(slot.everyMinutes) || 30))),
+    studyDailyBudget: Math.min(24, Math.max(1, Math.floor(Number(slot.dailyBudget) || slot.per || 4))),
   }
 }
 
@@ -545,7 +551,13 @@ export function decideStudy({ cfg, study, now, timeline }) {
   if (!w) return { ok: false, reason: 'no-window' }
   if (!inStudyWindow(w, new Date(now))) return { ok: false, reason: 'outside' }
   const mode = studyModeOf(cfg)
-  if (mode === 'day') {
+  if (Number(cfg?.studyEveryMinutes) > 0) {
+    // 心跳那套：只靠「距上次叫满一个频次」和「今天上限」，读没读过都不管
+    const budget = Math.max(1, Math.floor(Number(cfg.studyDailyBudget) || 4))
+    if ((Number(study.dayCount) || 0) >= budget) return { ok: false, reason: 'day-budget' }
+    const gap = Math.max(5, Math.floor(Number(cfg.studyEveryMinutes) || 30)) * 60000
+    if (study.lastAt && localDayOf(study.lastAt) === localDayOf(now) && now - study.lastAt < gap) return { ok: false, reason: 'gap' }
+  } else if (mode === 'day') {
     if ((Number(study.dayCount) || 0) >= studyPerDayOf(cfg)) return { ok: false, reason: 'day-budget' }
   } else {
     if (study.lastAt && localDayOf(study.lastAt) === localDayOf(now)) return { ok: false, reason: 'today-called' }
@@ -1148,7 +1160,6 @@ export function apply(ctx, rawConfig) {
       const dir = cfgNow.dir
       const st = await loadState(dir)
       const now = Date.now()
-      if (readSomethingToday(st, now)) return
       const slots = studySlotsOf(st, cfgNow)
       let changed = false
       for (const slot of slots) {
@@ -1303,6 +1314,7 @@ export function apply(ctx, rawConfig) {
               const c = slotStudyOf(s, Date.now())
               return {
                 id: s.id, index: i, enabled: s.enabled, from: s.from, to: s.to, mode: s.mode, per: s.per,
+                everyMinutes: s.everyMinutes, dailyBudget: s.dailyBudget,
                 session: s.session, sessionName: (liveSessions.find((x) => x.id === s.session) || {}).title || '',
                 lastAt: c.lastAt, dayCount: c.dayCount, weekCount: c.weekCount,
               }
