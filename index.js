@@ -1907,7 +1907,15 @@ async function signWork(rel, who) {
   const abs = join(root, rel)
   const n = (x) => String(x).replace(/\\/g, '/').toLowerCase()
   if (!n(abs).startsWith(n(root))) throw new Error('不在作品目录里')
-  let raw = await readFile(abs, 'utf8')
+  let raw
+  try {
+    raw = await readFile(abs, 'utf8')
+  } catch (e) {
+    if (e && (e.code === 'ENOENT' || e.code === 'ENOTDIR')) {
+      throw new Error('作品目录里没有这一份：' + rel + '（先放进 ' + root + ' 再署名）')
+    }
+    throw e
+  }
   const fm = raw.match(/^(?:\uFEFF)?---\r?\n([\s\S]*?)\r?\n---\r?\n?/)
   if (fm) {
     let inner = fm[1]
@@ -2454,8 +2462,12 @@ async function signWork(rel, who) {
         const who = String(args?.by || '').trim()
         const rel = String(args?.rel || '').trim()
         if (!who || !rel) return '要写清楚哪件作品（rel）和谁写的（by）'
-        const abs = await signWork(rel, who)
-        return '已署名：' + rel + ' —— ' + who + '（' + abs + '）'
+        try {
+          const abs = await signWork(rel, who)
+          return '已署名：' + rel + ' —— ' + who + '（' + abs + '）'
+        } catch (e) {
+          return '没署上：' + String((e && e.message) || e)
+        }
       },
     }),
   )
@@ -2776,8 +2788,9 @@ async function signWork(rel, who) {
           const blocks = md.split(/^### /m).slice(1)
           for (const b of blocks) {
             const head = (b.split('\n')[0] || '').trim()
-            const key = (head.match(/第[0-9]+章/) || [head.split(' ')[0]])[0]
-            notes[key] = (notes[key] || 0) + (b.match(/^-[ \t]/gm) || []).length
+            const key = (head.match(/第\s*[0-9]+\s*章/) || [head.split(' ')[0]])[0].replace(/\s+/g, '')
+            const lines = b.split(/\r?\n/).filter((l) => /^-[ \t]/.test(l) && !/^\s*-\s*↳/.test(l))
+            notes[key] = (notes[key] || 0) + lines.length
           }
         } catch {}
         return {
